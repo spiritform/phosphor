@@ -1,0 +1,14 @@
+[project]
+name = "hermestab"
+description = "CRT-styled Hermes AI chat sidebar for ComfyUI – build workflows with natural language"
+version = "1.0.0"
+license = "MIT"
+requires-python = ">=3.10"
+
+[project.urls]
+Repository = "https://github.com/yourusername/hermestab"
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "HermesTab"
+Icon = ""
