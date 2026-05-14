@@ -1,16 +1,15 @@
-"""HermesTab - Hermes chat sidebar for ComfyUI workflow building."""
+"""Phosphor - CRT-styled AI chat sidebar for ComfyUI workflow building."""
 
 import json
 import pathlib
-import shutil
 from aiohttp import web
 from server import PromptServer
 
 WORKFLOWS_DIR = pathlib.Path(__file__).parent / "workflows"
 
-# ── Serve built-in workflow templates ──
+# Serve built-in workflow templates
 
-@PromptServer.instance.routes.get("/hermes/workflows")
+@PromptServer.instance.routes.get("/phosphor/workflows")
 async def list_workflows(request):
     files = []
     if WORKFLOWS_DIR.exists():
@@ -19,7 +18,7 @@ async def list_workflows(request):
     return web.json_response(files)
 
 
-@PromptServer.instance.routes.get("/hermes/workflow/{name}")
+@PromptServer.instance.routes.get("/phosphor/workflow/{name}")
 async def get_workflow(request):
     name = request.match_info["name"]
     path = WORKFLOWS_DIR / f"{name}.json"
@@ -29,7 +28,7 @@ async def get_workflow(request):
     return web.json_response(data)
 
 
-@PromptServer.instance.routes.post("/hermes/workflow/save")
+@PromptServer.instance.routes.post("/phosphor/workflow/save")
 async def save_workflow(request):
     try:
         data = await request.json()
@@ -39,7 +38,6 @@ async def save_workflow(request):
             return web.json_response({"error": "name required"}, status=400)
         if not workflow:
             return web.json_response({"error": "workflow required"}, status=400)
-        # Sanitize filename
         safe = "".join(c if c.isalnum() or c in "-_ " else "" for c in name).strip()
         safe = safe.replace(" ", "_")
         if not safe:
@@ -52,7 +50,7 @@ async def save_workflow(request):
         return web.json_response({"error": str(e)}, status=500)
 
 
-@PromptServer.instance.routes.delete("/hermes/workflow/{name}")
+@PromptServer.instance.routes.delete("/phosphor/workflow/{name}")
 async def delete_workflow(request):
     name = request.match_info["name"]
     path = WORKFLOWS_DIR / f"{name}.json"
@@ -62,21 +60,21 @@ async def delete_workflow(request):
     return web.json_response({"success": True})
 
 
-# ── Minimal node (ComfyUI requires at least one for extension loading) ──
+# Minimal node (ComfyUI requires at least one for extension loading)
 
-class HermesTab:
+class Phosphor:
     @classmethod
     def INPUT_TYPES(cls):
         return {"optional": {}}
 
     RETURN_TYPES = ()
     FUNCTION = "noop"
-    CATEGORY = "hermes"
+    CATEGORY = "phosphor"
     OUTPUT_NODE = True
 
     def noop(self):
         return ()
 
 
-NODE_CLASS_MAPPINGS = {"HermesTab": HermesTab}
-NODE_DISPLAY_NAME_MAPPINGS = {"HermesTab": "Hermes Chat"}
+NODE_CLASS_MAPPINGS = {"Phosphor": Phosphor}
+NODE_DISPLAY_NAME_MAPPINGS = {"Phosphor": "Phosphor Chat"}

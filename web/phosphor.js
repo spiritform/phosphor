@@ -1,6 +1,7 @@
 /**
- * HermesTab — CRT-styled Hermes chat sidebar for ComfyUI
+ * Phosphor — CRT-styled AI chat sidebar for ComfyUI
  * Build, modify, and understand workflows through natural language.
+ * Provider-agnostic: works with OpenRouter, Ollama, or anything OpenAI-compatible.
  */
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
@@ -9,11 +10,19 @@ import { api } from "../../scripts/api.js";
 //  CONFIG
 // ═══════════════════════════════════════════════════════
 const CFG = {
-    ollamaHost: localStorage.getItem("hermes.host") || "http://127.0.0.1:11434",
-    model:      localStorage.getItem("hermes.model") || "hermes3:8b",
-    keepAlive:  "5m",
+    provider:    localStorage.getItem("hermes.provider")    || "openrouter",  // "openrouter" | "ollama"
+    apiBase:     localStorage.getItem("hermes.apiBase")     || "https://openrouter.ai/api/v1",
+    apiKey:      localStorage.getItem("hermes.apiKey")      || "",
+    apiModel:    localStorage.getItem("hermes.apiModel")    || localStorage.getItem("hermes.model") || "anthropic/claude-sonnet-4.6",
+    ollamaHost:  localStorage.getItem("hermes.ollamaHost")  || "http://127.0.0.1:11434",
+    ollamaModel: localStorage.getItem("hermes.ollamaModel") || "hermes3:8b",
+    keepAlive:   "5m",
     maxToolIter: 4,
 };
+
+function currentModel() {
+    return CFG.provider === "ollama" ? CFG.ollamaModel : CFG.apiModel;
+}
 
 // ═══════════════════════════════════════════════════════
 //  STATE
@@ -23,13 +32,23 @@ const S = {
     busy:      false,
     open:      false,
     connected: false,
+    undoStack: [],   // canvas snapshots taken before each mutating tool call
     width: parseInt(localStorage.getItem("hermes.panelWidth")) || 420,
     // DOM refs (set in buildPanel)
-    panel: null, log: null, input: null, dot: null, badge: null, toggle: null,
+    panel: null, log: null, input: null, provPill: null, badge: null, toggle: null,
 };
 
+// Tools that mutate the canvas — we snapshot before each of these runs.
+const MUTATING_TOOLS = new Set([
+    "add_node", "remove_node", "connect_nodes", "set_widget",
+    "set_node_position", "set_node_size", "arrange_grid",
+    "normalize_node_widths", "group_nodes",
+    "load_workflow", "load_template", "clear_canvas", "build_workflow",
+]);
+const UNDO_STACK_MAX = 20;
+
 // ═══════════════════════════════════════════════════════
-//  TOOL DEFINITIONS  (sent to Hermes in system prompt)
+//  TOOL DEFINITIONS  (sent to the model in system prompt)
 // ═══════════════════════════════════════════════════════
 const TOOL_DEFS = [
     {
@@ -133,6 +152,83 @@ const TOOL_DEFS = [
     {
         type: "function",
         function: {
+            name: "set_node_position",
+            description: "Move a single node to specific x,y coordinates on the canvas.",
+            parameters: {
+                type: "object",
+                properties: {
+                    node_id: { type: "number", description: "Node ID" },
+                    x:       { type: "number", description: "X position" },
+                    y:       { type: "number", description: "Y position" }
+                },
+                required: ["node_id", "x", "y"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "arrange_grid",
+            description: "Auto-arrange ALL nodes on the canvas into a clean grid. Preferred way to tidy up a messy layout — one call does the whole canvas.",
+            parameters: {
+                type: "object",
+                properties: {
+                    columns:   { type: "number", description: "Number of columns (default 4)" },
+                    spacing_x: { type: "number", description: "Horizontal spacing in px (default 350)" },
+                    spacing_y: { type: "number", description: "Vertical spacing in px (default 280)" },
+                    start_x:   { type: "number", description: "Starting X coordinate (default 60)" },
+                    start_y:   { type: "number", description: "Starting Y coordinate (default 80)" }
+                }
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "set_node_size",
+            description: "Resize a single node. Pass width and/or height in pixels.",
+            parameters: {
+                type: "object",
+                properties: {
+                    node_id: { type: "number", description: "Node ID" },
+                    width:   { type: "number", description: "New width in px" },
+                    height:  { type: "number", description: "New height in px" }
+                },
+                required: ["node_id"]
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "normalize_node_widths",
+            description: "Make every node on the canvas the same width. If `width` is omitted, uses the widest existing node so nothing gets clipped.",
+            parameters: {
+                type: "object",
+                properties: {
+                    width: { type: "number", description: "Target width in px (optional — defaults to widest existing node)" }
+                }
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "group_nodes",
+            description: "Wrap a set of nodes in a labeled ComfyUI group (a colored frame with a title). If node_ids is omitted, groups ALL nodes on the canvas.",
+            parameters: {
+                type: "object",
+                properties: {
+                    node_ids: { type: "array", items: { type: "number" }, description: "Optional list of node IDs to include. Omit to group everything on the canvas." },
+                    title:    { type: "string", description: "Label shown at the top of the group (default \"Group\")" },
+                    color:    { type: "string", description: "CSS color for the group frame (e.g. \"#3a5a3a\")" }
+                }
+            }
+        }
+    },
+    {
+        type: "function",
+        function: {
             name: "load_workflow",
             description: "Load a complete workflow JSON onto the canvas, replacing the current graph. Accepts ComfyUI editor-format JSON (with nodes[] and links[] arrays).",
             parameters: {
@@ -179,6 +275,14 @@ const TOOL_DEFS = [
         function: {
             name: "clear_canvas",
             description: "Remove ALL nodes from the canvas. Ask for confirmation before using.",
+            parameters: { type: "object", properties: {} }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "undo",
+            description: "Revert the last canvas-changing operation. Use this if the user says undo, revert, go back, or asks to take back the last change.",
             parameters: { type: "object", properties: {} }
         }
     },
@@ -238,17 +342,30 @@ For each function call return a json object with function name and arguments wit
 
 You are a ComfyUI workflow assistant. Act immediately. No apologies. No asking permission. No explaining plans.
 
-When modifying a workflow:
-1. Call get_canvas_info to find node IDs
-2. Call set_widget to change values
-That's it. Two calls max.
+═══ HARD RULES ═══
+
+1. NEVER call queue_prompt unless the user uses one of these EXACT words: "run", "generate", "execute", "go", "queue".
+   Words like "build", "create", "make", "load", "set up", "give me" do NOT mean run. Stop after loading.
+
+2. NEVER claim a workflow "is running" or "started" or "generating". If you call queue_prompt, the only acceptable confirmation is "Queued." — anything else is a lie.
+
+3. When loading a template that references a specific checkpoint file (e.g. sd_xl_base_1.0.safetensors), warn the user one line: "Note: needs <filename> — install via Manager if missing." Do NOT call queue_prompt.
+
+═══ WORKFLOW PATTERNS ═══
+
+The CURRENT CANVAS state is provided to you below (node IDs, types, widgets, and current values).
+USE THOSE IDS DIRECTLY. You do NOT need to call get_canvas_info for routine widget edits —
+the info you need is already in this prompt.
+
+To change a widget: ONE call. set_widget(node_id=<from canvas above>, widget_name=..., value=...).
+NEVER ask the user for a node ID — find it in the canvas snapshot.
 
 Templates: sd15_txt2img, sdxl_txt2img, flux_dev_txt2img, sdxl_img2img, sdxl_inpaint, upscale_4x, animatediff_video, wan_video_t2v
-When user wants a workflow, call load_template with the best match immediately.
+When user wants a workflow, call load_template with the best match. STOP. Do not run it.
 
 CLIPTextEncode widget name is "text". KSampler widgets: seed, steps, cfg, sampler_name, scheduler, denoise. CheckpointLoaderSimple widget: ckpt_name.
 
-Only call queue_prompt if user says "run" or "generate". Maximum 1 sentence of text per response.`;
+Maximum 1 sentence of text per response.`;
 
 // ═══════════════════════════════════════════════════════
 //  STYLES
@@ -256,12 +373,14 @@ Only call queue_prompt if user says "run" or "generate". Maximum 1 sentence of t
 const STYLES = `
 /* ── Panel ── */
 #hm-panel {
-    position: fixed; top: 0; right: 0;
-    padding-top: 34px;
-    width: var(--hm-w, 420px); height: 100vh;
-    background: #040e0b;
-    border-left: 1px solid #1a5a3a;
-    box-shadow: -4px 0 24px rgba(51,255,170,0.04);
+    position: fixed; top: var(--hm-top, 70px); right: 0;
+    width: var(--hm-w, 420px); height: calc(100vh - var(--hm-top, 70px));
+    background: rgba(4, 14, 11, 0.32);
+    backdrop-filter: blur(22px) saturate(170%);
+    -webkit-backdrop-filter: blur(22px) saturate(170%);
+    border-left: 1px solid rgba(51, 255, 170, 0.28);
+    border-top: 1px solid rgba(51, 255, 170, 0.18);
+    box-shadow: -4px 0 32px rgba(51,255,170,0.08), inset 1px 0 0 rgba(51,255,170,0.06);
     z-index: 1000;
     display: flex; flex-direction: column;
     font-family: 'Consolas', 'Menlo', 'Monaco', 'Courier New', monospace;
@@ -273,38 +392,36 @@ const STYLES = `
 }
 #hm-panel.open { transform: translateX(0); }
 
-/* Push ComfyUI canvas and menu when open */
-body.hm-open .comfyui-menu,
-body.hm-open header.comfyui-menu { right: var(--hm-w, 420px) !important; transition: right 0.28s ease; }
-body.hm-open #graph-canvas,
-body.hm-open .graph-canvas-container,
-body.hm-open .litegraph.litegraph-canvas { width: calc(100vw - var(--hm-w, 420px)) !important; transition: width 0.28s ease; }
-body.hm-resizing #hm-panel,
-body.hm-resizing .comfyui-menu,
-body.hm-resizing #graph-canvas,
-body.hm-resizing .graph-canvas-container,
-body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
+/* Panel sits below the top toolbar (no longer overlapping it) and floats above the canvas. */
+body.hm-resizing #hm-panel { transition: none !important; }
 
 /* ── Toggle tab ── */
 #hm-toggle {
-    position: fixed; right: 8px; bottom: 8px;
+    position: fixed; right: 16px; bottom: 16px;
     background: #0a1f18;
-    color: #33ffaa;
     border: 1px solid #1a5a3a;
     border-radius: 6px;
     width: 38px; height: 38px;
     display: flex; align-items: center; justify-content: center;
-    cursor: pointer; z-index: 999;
-    font-family: 'Courier New', monospace;
-    font-size: 16px;
-    text-shadow: 0 0 8px rgba(51,255,170,0.4);
+    cursor: pointer; z-index: 99999;
     transition: all 0.2s;
     user-select: none;
 }
+#hm-toggle::before {
+    content: '';
+    display: block;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, #88ffcc 0%, #33ffaa 50%, #1a7a55 100%);
+    box-shadow: 0 0 10px rgba(51,255,170,0.7), 0 0 18px rgba(51,255,170,0.3);
+    transition: all 0.2s;
+}
 #hm-toggle:hover {
     background: #0f2e22;
-    text-shadow: 0 0 14px rgba(51,255,170,0.7);
-    box-shadow: 0 0 12px rgba(51,255,170,0.2);
+    box-shadow: 0 0 12px rgba(51,255,170,0.25);
+}
+#hm-toggle:hover::before {
+    box-shadow: 0 0 14px rgba(51,255,170,0.9), 0 0 24px rgba(51,255,170,0.5);
 }
 
 /* ── Scanlines ── */
@@ -312,7 +429,7 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
     position: absolute; inset: 0;
     background: repeating-linear-gradient(
         to bottom, transparent 0px, transparent 2px,
-        rgba(0,0,0,0.05) 2px, rgba(0,0,0,0.05) 4px
+        rgba(0,0,0,0.025) 2px, rgba(0,0,0,0.025) 4px
     );
     pointer-events: none; z-index: 5;
 }
@@ -331,8 +448,8 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
 #hm-header {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 14px;
-    border-bottom: 1px solid #1a5a3a;
-    background: #061510;
+    border-bottom: 1px solid rgba(51, 255, 170, 0.18);
+    background: rgba(6, 21, 16, 0.32);
     flex-shrink: 0;
     position: relative; z-index: 6;
 }
@@ -343,24 +460,28 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
     flex-grow: 1;
     letter-spacing: 1px;
 }
-.hm-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: #553333;
-    box-shadow: 0 0 4px #55333388;
-    transition: all 0.3s;
-    flex-shrink: 0;
+/* Provider+model label, plain text (no pill/box). Same monospace as the panel. */
+.hm-prov-label {
+    font-size: 11px;
+    color: #886655;
+    transition: color 0.2s, text-shadow 0.2s;
+    display: inline-flex;
+    align-items: baseline;
 }
-.hm-dot.on {
-    background: #33ff88;
-    box-shadow: 0 0 8px #33ff88aa;
+.hm-prov-word {
+    cursor: pointer;
+    user-select: none;
+    transition: color 0.15s, text-shadow 0.15s;
 }
-.hm-model-badge {
-    font-size: 10px; color: #aaddcc;
-    background: #0a2218;
-    padding: 2px 8px;
-    border-radius: 3px;
-    border: 1px solid #1a4a3a;
+.hm-prov-word:hover {
+    text-shadow: 0 0 6px rgba(51,255,170,0.5);
 }
+.hm-prov-sep { color: #4a7a6a; }
+.hm-prov-model { color: inherit; opacity: 0.85; }
+/* Color the whole label green when connected (replaces old dot indicator) */
+.hm-prov-word.connected,
+.hm-prov-word.connected ~ .hm-prov-model { color: #33ffaa; }
+.hm-prov-word.connected ~ .hm-prov-sep { color: #2a8a6a; }
 .hm-hdr-btn {
     background: none; border: none;
     color: #899; cursor: pointer;
@@ -374,12 +495,12 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
 #hm-settings {
     max-height: 0; overflow: hidden;
     transition: max-height 0.3s ease;
-    background: #071612;
+    background: rgba(7, 22, 18, 0.55);
     border-bottom: 1px solid transparent;
 }
 #hm-settings.open {
-    max-height: 200px;
-    border-bottom-color: #1a5a3a;
+    max-height: 400px;
+    border-bottom-color: rgba(51, 255, 170, 0.18);
 }
 #hm-settings-inner {
     padding: 10px 14px;
@@ -391,12 +512,13 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
 .hm-srow label {
     font-size: 11px; color: #aaddcc; min-width: 46px;
 }
-.hm-srow input {
+.hm-srow input, .hm-srow select {
     flex: 1; background: #0a1f18; border: 1px solid #1a4a3a;
     color: #c8fff0; font-family: monospace; font-size: 12px;
     padding: 4px 8px; border-radius: 3px; outline: none;
 }
-.hm-srow input:focus { border-color: #33ffaa; }
+.hm-srow input:focus, .hm-srow select:focus { border-color: #33ffaa; }
+.hm-srow select option { background: #0a1f18; color: #c8fff0; }
 .hm-btn {
     background: #0f2e22; border: 1px solid #1a5a3a;
     color: #33ffaa; font-family: monospace; font-size: 11px;
@@ -409,8 +531,8 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
 #hm-template-bar {
     display: flex; align-items: center; gap: 6px;
     padding: 6px 14px;
-    border-bottom: 1px solid #1a5a3a;
-    background: #071612;
+    border-bottom: 1px solid rgba(51, 255, 170, 0.18);
+    background: rgba(7, 22, 18, 0.28);
     flex-shrink: 0;
     position: relative; z-index: 6;
 }
@@ -470,27 +592,39 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
 .hm-msg-err { color: #ff5555; }
 .hm-msg-err .hm-prefix { color: #ff5555; }
 
-/* ── Tool blocks ── */
+/* ── Tool blocks (low-key code-log style) ── */
 .hm-tool-block {
-    margin: 6px 0; padding: 5px 10px;
-    background: #081a14;
-    border-left: 2px solid #2288aa;
-    font-size: 12px; color: #aaddcc;
-    border-radius: 0 4px 4px 0;
+    margin: 1px 0; padding: 1px 8px;
+    background: transparent;
+    border-left: 1px solid rgba(51, 255, 170, 0.18);
+    font-size: 11px;
+    color: rgba(122, 200, 165, 0.55);
+    border-radius: 0;
+    opacity: 0.7;
+    transition: opacity 0.15s, border-color 0.15s;
+}
+/* Group consecutive tool blocks visually tighter */
+.hm-tool-block + .hm-tool-block { margin-top: 0; }
+.hm-tool-block:hover {
+    opacity: 1;
+    border-left-color: rgba(51, 255, 170, 0.5);
 }
 .hm-tool-block summary {
-    color: #44aaff; outline: none;
+    color: rgba(122, 200, 165, 0.7); outline: none;
     cursor: pointer; user-select: none;
     list-style: none;
+    font-family: 'Consolas', 'Menlo', monospace;
 }
 .hm-tool-block summary::-webkit-details-marker { display: none; }
-.hm-tool-block summary::before { content: '\\25b8 '; color: #44aaff; }
-.hm-tool-block[open] summary::before { content: '\\25be '; }
+.hm-tool-block summary::before { content: '\\203a '; color: rgba(51,255,170,0.4); }
+.hm-tool-block[open] summary::before { content: '\\25be '; color: rgba(51,255,170,0.7); }
+.hm-tool-block[open] { opacity: 1; }
 .hm-tool-result {
-    margin-top: 6px; white-space: pre-wrap;
+    margin-top: 4px; white-space: pre-wrap;
     max-height: 180px; overflow-y: auto;
-    font-size: 11px; color: #99ccbb;
-    padding: 4px 0;
+    font-size: 11px; color: rgba(153, 204, 187, 0.7);
+    padding: 4px 0 4px 8px;
+    border-top: 1px dotted rgba(51, 255, 170, 0.08);
 }
 .hm-tool-result::-webkit-scrollbar { width: 4px; }
 .hm-tool-result::-webkit-scrollbar-thumb { background: #1a4a3a; border-radius: 2px; }
@@ -499,8 +633,8 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
 #hm-input-area {
     display: flex; align-items: flex-end;
     padding: 10px 14px;
-    border-top: 1px solid #1a5a3a;
-    background: #061510;
+    border-top: 1px solid rgba(51, 255, 170, 0.18);
+    background: rgba(6, 21, 16, 0.32);
     flex-shrink: 0;
     position: relative; z-index: 6;
 }
@@ -520,11 +654,30 @@ body.hm-resizing .litegraph.litegraph-canvas { transition: none !important; }
 #hm-input::placeholder { color: #558870; }
 #hm-input:disabled { opacity: 0.5; }
 
+/* Inline clear button next to the textarea (moved out of header) */
+.hm-input-clear {
+    background: none;
+    border: none;
+    color: rgba(122, 200, 165, 0.4);
+    cursor: pointer;
+    font-family: monospace;
+    font-size: 14px;
+    padding: 4px 6px;
+    margin-left: 4px;
+    align-self: center;
+    transition: color 0.15s, text-shadow 0.15s;
+    user-select: none;
+}
+.hm-input-clear:hover {
+    color: #33ffaa;
+    text-shadow: 0 0 8px rgba(51,255,170,0.5);
+}
+
 /* ── Hint ── */
 #hm-hint {
     padding: 3px 14px 8px;
     font-size: 10px; color: #5a9980;
-    background: #061510;
+    background: rgba(6, 21, 16, 0.32);
     flex-shrink: 0;
     position: relative; z-index: 6;
 }
@@ -783,6 +936,86 @@ const TOOL_IMPL = {
         return `Set ${node.type}#${node_id}.${widget_name} = ${JSON.stringify(value)}`;
     },
 
+    async set_node_position({ node_id, x, y }) {
+        const node = app.graph.getNodeById(node_id);
+        if (!node) return `Error: node ${node_id} not found`;
+        node.pos = [x, y];
+        app.graph.setDirtyCanvas(true, true);
+        return `Moved ${node.type}#${node_id} → (${x}, ${y})`;
+    },
+
+    async arrange_grid({ columns = 4, spacing_x = 350, spacing_y = 280, start_x = 60, start_y = 80 } = {}) {
+        const nodes = app.graph._nodes || [];
+        if (nodes.length === 0) return "Canvas is empty — nothing to arrange.";
+        nodes.forEach((node, i) => {
+            const col = i % columns;
+            const row = Math.floor(i / columns);
+            node.pos = [start_x + col * spacing_x, start_y + row * spacing_y];
+        });
+        app.graph.setDirtyCanvas(true, true);
+        return `Arranged ${nodes.length} nodes in a ${columns}-column grid.`;
+    },
+
+    async set_node_size({ node_id, width, height }) {
+        const node = app.graph.getNodeById(node_id);
+        if (!node) return `Error: node ${node_id} not found`;
+        if (!node.size) node.size = [200, 100];
+        if (width  != null) node.size[0] = width;
+        if (height != null) node.size[1] = height;
+        app.graph.setDirtyCanvas(true, true);
+        return `Resized ${node.type}#${node_id} to (${node.size[0]}, ${node.size[1]})`;
+    },
+
+    async normalize_node_widths({ width } = {}) {
+        const nodes = app.graph._nodes || [];
+        if (nodes.length === 0) return "Canvas is empty.";
+        const targetWidth = width != null
+            ? width
+            : Math.max(...nodes.map(n => (n.size && n.size[0]) || 200));
+        nodes.forEach(n => {
+            if (!n.size) n.size = [targetWidth, 100];
+            else n.size[0] = targetWidth;
+        });
+        app.graph.setDirtyCanvas(true, true);
+        return `Set all ${nodes.length} nodes to width ${targetWidth}px.`;
+    },
+
+    async group_nodes({ node_ids, title = "Group", color = "#3a5a3a" } = {}) {
+        let nodes;
+        if (Array.isArray(node_ids) && node_ids.length > 0) {
+            nodes = node_ids.map(id => app.graph.getNodeById(id)).filter(Boolean);
+        } else {
+            nodes = (app.graph._nodes || []).slice();
+        }
+        if (nodes.length === 0) return "No nodes to group.";
+
+        // Compute bounding box, with padding + extra top for the group title bar
+        const PAD = 20;
+        const TITLE_BAR = 30;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const n of nodes) {
+            const [x, y] = n.pos || [0, 0];
+            const [w, h] = n.size || [200, 100];
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x + w > maxX) maxX = x + w;
+            if (y + h > maxY) maxY = y + h;
+        }
+        minX -= PAD; minY -= PAD + TITLE_BAR;
+        maxX += PAD; maxY += PAD;
+
+        if (!LiteGraph.LGraphGroup) {
+            return "Error: this ComfyUI version does not expose LGraphGroup.";
+        }
+        const group = new LiteGraph.LGraphGroup();
+        group.title = title;
+        if (group.color !== undefined) group.color = color;
+        group.bounding = [minX, minY, maxX - minX, maxY - minY];
+        app.graph.add(group);
+        app.graph.setDirtyCanvas(true, true);
+        return `Created group "${title}" around ${nodes.length} nodes.`;
+    },
+
     async load_workflow({ workflow }) {
         if (!workflow) return "Error: no workflow data provided";
         try {
@@ -795,7 +1028,7 @@ const TOOL_IMPL = {
 
     async load_template({ name }) {
         try {
-            const res = await fetch(`/hermes/workflow/${encodeURIComponent(name)}`);
+            const res = await fetch(`/phosphor/workflow/${encodeURIComponent(name)}`);
             if (!res.ok) return `Error: template "${name}" not found`;
             const data = await res.json();
             return await _loadWorkflowData(data, name);
@@ -806,7 +1039,7 @@ const TOOL_IMPL = {
 
     async list_templates() {
         try {
-            const res = await fetch("/hermes/workflows");
+            const res = await fetch("/phosphor/workflows");
             if (!res.ok) return "No templates available";
             const list = await res.json();
             if (list.length === 0) return "No templates found in workflows/ directory";
@@ -829,6 +1062,20 @@ const TOOL_IMPL = {
         app.graph.clear();
         app.graph.setDirtyCanvas(true, true);
         return "Canvas cleared — all nodes removed.";
+    },
+
+    async undo() {
+        if (S.undoStack.length === 0) {
+            return "Nothing to undo.";
+        }
+        const snapshot = S.undoStack.pop();
+        try {
+            await app.loadGraphData(snapshot);
+            app.graph.setDirtyCanvas(true, true);
+            return `Reverted (${S.undoStack.length} undo${S.undoStack.length === 1 ? "" : "s"} left).`;
+        } catch (e) {
+            return `Error during undo: ${e.message}`;
+        }
     },
 
     async build_workflow({ nodes = [], connections = [] }) {
@@ -908,22 +1155,111 @@ const TOOL_IMPL = {
 };
 
 // ═══════════════════════════════════════════════════════
+//  CANVAS SNAPSHOT (auto-injected into system message)
+// ═══════════════════════════════════════════════════════
+// Saves the model a get_canvas_info round-trip on every request
+// — huge win for smaller models that flake on chaining.
+
+function getCanvasSnapshot() {
+    const nodes = app.graph?._nodes || [];
+    if (nodes.length === 0) {
+        return "═══ CURRENT CANVAS ═══\n(empty — no nodes on canvas)";
+    }
+    const lines = nodes.map(n => {
+        const widgets = (n.widgets || [])
+            .map(w => {
+                let v = w.value;
+                if (typeof v === "string" && v.length > 80) v = v.slice(0, 77) + "...";
+                return `${w.name}=${JSON.stringify(v)}`;
+            })
+            .join(", ");
+        const title = n.title && n.title !== n.type ? ` "${n.title}"` : "";
+        return `#${n.id} ${n.type}${title}${widgets ? " | " + widgets : ""}`;
+    });
+    return `═══ CURRENT CANVAS (${nodes.length} nodes) ═══\n${lines.join("\n")}`;
+}
+
+// ═══════════════════════════════════════════════════════
 //  CHAT ENGINE
 // ═══════════════════════════════════════════════════════
 
+async function streamChat(messages, tools, onToken) {
+    return CFG.provider === "ollama"
+        ? streamOllama(messages, tools, onToken)
+        : streamOpenRouter(messages, tools, onToken);
+}
+
+async function streamOpenRouter(messages, _tools, onToken) {
+    if (!CFG.apiKey) {
+        throw new Error("No API key set. Open settings (⚙) and paste your OpenRouter key.");
+    }
+
+    const body = {
+        model:    CFG.apiModel,
+        messages,
+        stream:   true,
+    };
+
+    const res = await fetch(`${CFG.apiBase}/chat/completions`, {
+        method: "POST",
+        headers: {
+            "Content-Type":  "application/json",
+            "Authorization": `Bearer ${CFG.apiKey}`,
+            "HTTP-Referer":  location.origin,
+            "X-Title":       "Phosphor",
+        },
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`HTTP ${res.status}: ${err.slice(0, 200)}`);
+    }
+
+    const reader = res.body.getReader();
+    const dec    = new TextDecoder();
+    let fullText = "", buf = "";
+    const toolCalls = [];
+
+    const processLine = (line) => {
+        if (!line.startsWith("data:")) return;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") return;
+        try {
+            const j = JSON.parse(data);
+            const delta = j.choices?.[0]?.delta;
+            if (delta?.content) {
+                fullText += delta.content;
+                onToken(delta.content);
+            }
+        } catch { /* partial / non-JSON SSE event */ }
+    };
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) processLine(line);
+    }
+    if (buf.trim()) processLine(buf);
+    return { text: fullText, toolCalls };
+}
+
 async function streamOllama(messages, tools, onToken) {
     const body = {
-        model:      CFG.model,
+        model:      CFG.ollamaModel,
         messages,
         stream:     true,
         keep_alive: CFG.keepAlive,
+        options:    { temperature: 0.2 },
     };
     if (tools) body.tools = tools;
 
     const res = await fetch(`${CFG.ollamaHost}/api/chat`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body:    JSON.stringify(body),
     });
     if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
 
@@ -932,30 +1268,10 @@ async function streamOllama(messages, tools, onToken) {
     let fullText = "", buf = "";
     let toolCalls = [];
 
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-                const j = JSON.parse(line);
-                if (j.message?.content) {
-                    fullText += j.message.content;
-                    onToken(j.message.content);
-                }
-                // Collect native tool calls
-                if (j.message?.tool_calls) {
-                    toolCalls = toolCalls.concat(j.message.tool_calls);
-                }
-            } catch { /* partial JSON, skip */ }
-        }
-    }
-    if (buf.trim()) {
+    const processLine = (line) => {
+        if (!line.trim()) return;
         try {
-            const j = JSON.parse(buf);
+            const j = JSON.parse(line);
             if (j.message?.content) {
                 fullText += j.message.content;
                 onToken(j.message.content);
@@ -963,8 +1279,18 @@ async function streamOllama(messages, tools, onToken) {
             if (j.message?.tool_calls) {
                 toolCalls = toolCalls.concat(j.message.tool_calls);
             }
-        } catch { /* ignore */ }
+        } catch { /* partial JSON */ }
+    };
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        for (const line of lines) processLine(line);
     }
+    if (buf.trim()) processLine(buf);
     return { text: fullText, toolCalls };
 }
 
@@ -982,6 +1308,13 @@ function parseXmlToolCalls(text) {
 async function execToolCall(call) {
     const fn = TOOL_IMPL[call.name];
     if (!fn) return `Error: unknown tool "${call.name}"`;
+    // Snapshot the canvas before any mutating tool — gives us undo.
+    if (MUTATING_TOOLS.has(call.name)) {
+        try {
+            S.undoStack.push(app.graph.serialize());
+            if (S.undoStack.length > UNDO_STACK_MAX) S.undoStack.shift();
+        } catch { /* serialize failed — skip, not critical */ }
+    }
     try {
         return await fn(call.arguments || {});
     } catch (e) {
@@ -1052,13 +1385,19 @@ async function handleSend(userText) {
     let lastCallSig = "";
     try {
         for (let iter = 0; iter < CFG.maxToolIter; iter++) {
-            const msgs = [{ role: "system", content: SYS_PROMPT }, ...S.history];
-            const { div: msgDiv, body: bodyEl } = appendMsg("bot", "hermes> ", "");
+            // Auto-inject canvas state so the model can skip get_canvas_info
+            // and call set_widget directly with known node IDs.
+            const sysContent = SYS_PROMPT + "\n\n" + getCanvasSnapshot();
+            const msgs = [{ role: "system", content: sysContent }, ...S.history];
+            const { div: msgDiv, body: bodyEl } = appendMsg("bot", "phosphor>", "");
             msgDiv.classList.add("hm-cursor");
 
             let result;
             try {
-                result = await streamOllama(msgs, null, (token) => {
+                // Pass tool defs only to local Ollama (it uses them natively).
+                // OpenRouter path already gets them via the XML system prompt.
+                const toolsForCall = CFG.provider === "ollama" ? TOOL_DEFS : null;
+                result = await streamChat(msgs, toolsForCall, (token) => {
                     msgDiv.classList.remove("hm-cursor");
                     bodyEl.textContent += token;
                     S.log.scrollTop = S.log.scrollHeight;
@@ -1074,7 +1413,12 @@ async function handleSend(userText) {
 
             // Clean any XML tool_call tags from displayed text
             const cleanText = result.text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
-            bodyEl.textContent = cleanText;
+            if (cleanText) {
+                bodyEl.textContent = cleanText;
+            } else {
+                // No prose content — model only emitted tool calls. Drop the empty "hermes>" line.
+                msgDiv.remove();
+            }
 
             // Build assistant history entry
             const assistantMsg = { role: "assistant", content: result.text || "" };
@@ -1105,11 +1449,16 @@ async function handleSend(userText) {
             }
             lastCallSig = callSig;
 
-            // Execute each tool and feed results back
+            // Execute each tool and feed results back as user messages
+            // (avoids the OpenAI requirement for tool_call_id/call_id on `role: tool` messages,
+            //  since we use XML <tool_call> blocks rather than native function calling)
             for (const call of calls) {
                 const toolResult = await execToolCall(call);
                 appendToolBlock(call.name, call.arguments, toolResult);
-                S.history.push({ role: "tool", content: String(toolResult) });
+                S.history.push({
+                    role: "user",
+                    content: `<tool_response name="${call.name}">\n${String(toolResult)}\n</tool_response>`,
+                });
             }
         }
     } finally {
@@ -1148,14 +1497,25 @@ function handleCommand(text) {
             }
             break;
 
-        case "/host":
+        case "/base":
             if (parts[1]) {
-                CFG.ollamaHost = parts[1];
-                localStorage.setItem("hermes.host", CFG.ollamaHost);
-                appendMsg("sys", "", `Host → ${CFG.ollamaHost}`);
+                CFG.apiBase = parts[1];
+                localStorage.setItem("hermes.apiBase", CFG.apiBase);
+                appendMsg("sys", "", `API base → ${CFG.apiBase}`);
                 checkConnection();
             } else {
-                appendMsg("sys", "", `Current host: ${CFG.ollamaHost}`);
+                appendMsg("sys", "", `Current API base: ${CFG.apiBase}`);
+            }
+            break;
+
+        case "/key":
+            if (parts[1]) {
+                CFG.apiKey = parts.slice(1).join(" ");
+                localStorage.setItem("hermes.apiKey", CFG.apiKey);
+                appendMsg("sys", "", `API key set (${CFG.apiKey.length} chars)`);
+                checkConnection();
+            } else {
+                appendMsg("sys", "", CFG.apiKey ? `API key: ${CFG.apiKey.slice(0,7)}...${CFG.apiKey.slice(-4)}` : "No API key set");
             }
             break;
 
@@ -1163,21 +1523,36 @@ function handleCommand(text) {
             handleSend("Describe the current workflow on the canvas in detail. Use get_canvas_info to inspect it.");
             break;
 
+        case "/undo":
+            execToolCall({ name: "undo", arguments: {} }).then(result => {
+                appendMsg("sys", "", result);
+            });
+            break;
+
         case "/help":
             appendMsg("sys", "", [
                 "COMMANDS",
                 "  /clear       reset chat history",
-                "  /model X     switch Ollama model",
-                "  /host URL    change Ollama endpoint",
+                "  /undo        revert last canvas change",
+                "  /model X     switch model (e.g. anthropic/claude-sonnet-4.6)",
+                "  /key X       set API key",
+                "  /base URL    change API base URL",
                 "  /workflow    describe current canvas",
                 "  /help        this message",
                 "",
                 "TIPS",
-                "  \"build a txt2img workflow with SDXL\"",
-                "  \"add an upscaler after the output\"",
-                "  \"change steps to 30 and cfg to 7\"",
+                "  \"load the sdxl template\"",
+                "  \"change steps to 30, cfg to 7\"",
+                "  \"change prompt to a neon city at night\"",
+                "  \"switch the checkpoint to flux-dev\"",
+                "  \"arrange the nodes in a grid\"",
+                "  \"undo that\" → revert last change",
                 "  \"what does this workflow do?\"",
                 "  \"run it\" → queues the prompt",
+                "",
+                "PROVIDER",
+                "  click  Local / API  in header to toggle",
+                "  click  ⚙           to set key, base, model",
                 "",
                 "SHORTCUTS",
                 "  Ctrl+Shift+H  toggle panel",
@@ -1196,13 +1571,29 @@ function handleCommand(text) {
 // ═══════════════════════════════════════════════════════
 
 async function checkConnection() {
-    try {
-        const res = await fetch(`${CFG.ollamaHost}/api/tags`, { signal: AbortSignal.timeout(3000) });
-        S.connected = res.ok;
-    } catch {
-        S.connected = false;
+    if (CFG.provider === "ollama") {
+        try {
+            const res = await fetch(`${CFG.ollamaHost}/api/tags`, { signal: AbortSignal.timeout(3000) });
+            S.connected = res.ok;
+        } catch {
+            S.connected = false;
+        }
+    } else {
+        if (!CFG.apiKey) {
+            S.connected = false;
+        } else {
+            try {
+                const res = await fetch(`${CFG.apiBase}/models`, {
+                    headers: { "Authorization": `Bearer ${CFG.apiKey}` },
+                    signal:  AbortSignal.timeout(5000),
+                });
+                S.connected = res.ok;
+            } catch {
+                S.connected = false;
+            }
+        }
     }
-    if (S.dot) S.dot.classList.toggle("on", S.connected);
+    if (S.provPill) S.provPill.classList.toggle("connected", S.connected);
     return S.connected;
 }
 
@@ -1219,7 +1610,7 @@ function buildPanel() {
     // ── Toggle tab ──
     const toggle = document.createElement("div");
     toggle.id = "hm-toggle";
-    toggle.textContent = "\u27e8H\u27e9";
+    // Icon is drawn purely via CSS (#hm-toggle::before) \u2014 no font dependency.
     document.body.appendChild(toggle);
 
     // ── Panel ──
@@ -1242,31 +1633,43 @@ function buildPanel() {
 
     const title = document.createElement("span");
     title.className = "hm-title";
-    title.textContent = "\u27e8HERMES\u27e9";
+    title.textContent = "\u25cf PHOSPHOR";
 
-    const dot = document.createElement("span");
-    dot.className = "hm-dot";
+    // Combined provider/model label: "Local : qwen2.5:14b"
+    // Clicking the provider word toggles API ↔ LOCAL. Color reflects connection.
+    const provInfo = document.createElement("span");
+    provInfo.className = "hm-prov-label";
 
-    const badge = document.createElement("span");
-    badge.className = "hm-model-badge";
-    badge.textContent = CFG.model;
+    const provWord = document.createElement("span");
+    provWord.className = "hm-prov-word";
+    provWord.textContent = CFG.provider === "ollama" ? "Local" : "API";
+    provWord.title = "Click to toggle API ↔ LOCAL";
+
+    const provSep = document.createElement("span");
+    provSep.className = "hm-prov-sep";
+    provSep.textContent = " : ";
+
+    const modelText = document.createElement("span");
+    modelText.className = "hm-prov-model";
+    modelText.textContent = currentModel();
+
+    provInfo.append(provWord, provSep, modelText);
+
+    // Compatibility aliases so existing code that references provPill / badge keeps working.
+    const provPill = provWord;
+    const badge = modelText;
 
     const settingsBtn = document.createElement("button");
     settingsBtn.className = "hm-hdr-btn";
     settingsBtn.textContent = "\u2699";
     settingsBtn.title = "Settings";
 
-    const clearBtn = document.createElement("button");
-    clearBtn.className = "hm-hdr-btn";
-    clearBtn.textContent = "\u232b";
-    clearBtn.title = "Clear chat";
-
     const closeBtn = document.createElement("button");
     closeBtn.className = "hm-hdr-btn";
     closeBtn.textContent = "\u2715";
     closeBtn.title = "Close";
 
-    header.append(title, dot, badge, settingsBtn, clearBtn, closeBtn);
+    header.append(title, provInfo, settingsBtn, closeBtn);
     panel.appendChild(header);
 
     // ── Settings ──
@@ -1276,21 +1679,138 @@ function buildPanel() {
     const settingsInner = document.createElement("div");
     settingsInner.id = "hm-settings-inner";
 
+    // ── Provider toggle ──
+    const provRow = document.createElement("div");
+    provRow.className = "hm-srow";
+    const provLabel = document.createElement("label");
+    provLabel.textContent = "Mode:";
+    const provInput = document.createElement("select");
+    for (const [v, t] of [["openrouter", "API (OpenRouter)"], ["ollama", "Local (Ollama)"]]) {
+        const opt = document.createElement("option");
+        opt.value = v; opt.textContent = t;
+        if (v === CFG.provider) opt.selected = true;
+        provInput.appendChild(opt);
+    }
+    provRow.append(provLabel, provInput);
+
+    // ── API-mode rows ──
+    const keyRow = document.createElement("div");
+    keyRow.className = "hm-srow";
+    const keyLabel = document.createElement("label");
+    keyLabel.textContent = "Key:";
+    const keyInput = document.createElement("input");
+    keyInput.type = "password";
+    keyInput.value = CFG.apiKey;
+    keyInput.placeholder = "sk-or-v1-...";
+    keyRow.append(keyLabel, keyInput);
+
+    const baseRow = document.createElement("div");
+    baseRow.className = "hm-srow";
+    const baseLabel = document.createElement("label");
+    baseLabel.textContent = "Base:";
+    const baseInput = document.createElement("input");
+    baseInput.value = CFG.apiBase;
+    baseRow.append(baseLabel, baseInput);
+
+    // ── Local-mode row ──
     const hostRow = document.createElement("div");
     hostRow.className = "hm-srow";
     const hostLabel = document.createElement("label");
     hostLabel.textContent = "Host:";
     const hostInput = document.createElement("input");
     hostInput.value = CFG.ollamaHost;
+    hostInput.placeholder = "http://127.0.0.1:11434";
     hostRow.append(hostLabel, hostInput);
 
-    const modelRow = document.createElement("div");
-    modelRow.className = "hm-srow";
-    const modelLabel = document.createElement("label");
-    modelLabel.textContent = "Model:";
-    const modelInput = document.createElement("input");
-    modelInput.value = CFG.model;
-    modelRow.append(modelLabel, modelInput);
+    // ── Model rows (one per provider, only the active one is shown) ──
+    const API_PRESETS = [
+        { id: "anthropic/claude-sonnet-4.6",          label: "Claude Sonnet 4.6  (top tool-caller)" },
+        { id: "anthropic/claude-opus-4.6",            label: "Claude Opus 4.6  (smartest)" },
+        { id: "anthropic/claude-haiku-4.5",           label: "Claude Haiku 4.5  (cheapest)" },
+        { id: "nousresearch/hermes-4-405b",           label: "Hermes 4 405B  (Nous flagship)" },
+        { id: "nousresearch/hermes-4-70b",            label: "Hermes 4 70B  (Nous)" },
+        { id: "openai/gpt-5",                         label: "GPT-5" },
+        { id: "openai/gpt-5-mini",                    label: "GPT-5 mini" },
+        { id: "google/gemini-2.5-pro",                label: "Gemini 2.5 Pro" },
+        { id: "meta-llama/llama-3.3-70b-instruct",    label: "Llama 3.3 70B" },
+        { id: "qwen/qwen-2.5-72b-instruct",           label: "Qwen 2.5 72B" },
+    ];
+    const OLLAMA_PRESETS = [
+        { id: "hermes3:8b",      label: "Hermes 3 8B" },
+        { id: "hermes3:70b",     label: "Hermes 3 70B" },
+        { id: "llama3.2",        label: "Llama 3.2" },
+        { id: "llama3.2:3b",     label: "Llama 3.2 3B" },
+        { id: "qwen2.5",         label: "Qwen 2.5" },
+        { id: "qwen2.5-coder",   label: "Qwen 2.5 Coder" },
+        { id: "mistral",         label: "Mistral" },
+        { id: "phi4",            label: "Phi 4" },
+    ];
+
+    const buildModelSelect = (presets, currentValue) => {
+        const sel = document.createElement("select");
+        let found = false;
+        for (const m of presets) {
+            const opt = document.createElement("option");
+            opt.value = m.id; opt.textContent = m.label;
+            if (m.id === currentValue) { opt.selected = true; found = true; }
+            sel.appendChild(opt);
+        }
+        if (!found && currentValue) {
+            const opt = document.createElement("option");
+            opt.value = currentValue;
+            opt.textContent = `${currentValue}  (custom)`;
+            opt.selected = true;
+            sel.appendChild(opt);
+        }
+        return sel;
+    };
+
+    const apiModelRow = document.createElement("div");
+    apiModelRow.className = "hm-srow";
+    const apiModelLabel = document.createElement("label");
+    apiModelLabel.textContent = "Model:";
+    const apiModelInput = buildModelSelect(API_PRESETS, CFG.apiModel);
+    apiModelRow.append(apiModelLabel, apiModelInput);
+
+    const ollamaModelRow = document.createElement("div");
+    ollamaModelRow.className = "hm-srow";
+    const ollamaModelLabel = document.createElement("label");
+    ollamaModelLabel.textContent = "Model:";
+    const ollamaModelInput = buildModelSelect(OLLAMA_PRESETS, CFG.ollamaModel);
+    ollamaModelRow.append(ollamaModelLabel, ollamaModelInput);
+
+    // Live-refresh ollama models from /api/tags so the dropdown reflects
+    // what's actually installed (not a hardcoded list).
+    const refreshOllamaModels = async () => {
+        try {
+            const res = await fetch(`${hostInput.value.trim() || CFG.ollamaHost}/api/tags`, {
+                signal: AbortSignal.timeout(3000),
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+            const installed = (data.models || []).map(m => ({
+                id: m.name,
+                label: `${m.name}  (${(m.size / 1e9).toFixed(1)} GB)`,
+            }));
+            if (installed.length === 0) return;
+            const prev = ollamaModelInput.value;
+            ollamaModelInput.innerHTML = "";
+            let found = false;
+            for (const m of installed) {
+                const opt = document.createElement("option");
+                opt.value = m.id; opt.textContent = m.label;
+                if (m.id === prev) { opt.selected = true; found = true; }
+                ollamaModelInput.appendChild(opt);
+            }
+            if (!found && prev) {
+                const opt = document.createElement("option");
+                opt.value = prev; opt.textContent = `${prev}  (not installed)`;
+                opt.selected = true;
+                ollamaModelInput.appendChild(opt);
+            }
+        } catch { /* ollama unreachable — keep hardcoded presets */ }
+    };
+    refreshOllamaModels();
 
     const applyRow = document.createElement("div");
     applyRow.className = "hm-srow";
@@ -1300,7 +1820,21 @@ function buildPanel() {
     applyBtn.textContent = "Apply";
     applyRow.appendChild(applyBtn);
 
-    settingsInner.append(hostRow, modelRow, applyRow);
+    settingsInner.append(provRow, keyRow, baseRow, hostRow, apiModelRow, ollamaModelRow, applyRow);
+
+    // Show/hide rows based on selected provider
+    const syncProviderRows = () => {
+        const p = provInput.value;
+        keyRow.style.display         = p === "openrouter" ? "" : "none";
+        baseRow.style.display        = p === "openrouter" ? "" : "none";
+        apiModelRow.style.display    = p === "openrouter" ? "" : "none";
+        hostRow.style.display        = p === "ollama"     ? "" : "none";
+        ollamaModelRow.style.display = p === "ollama"     ? "" : "none";
+        if (p === "ollama") refreshOllamaModels();
+    };
+    syncProviderRows();
+    provInput.addEventListener("change", syncProviderRows);
+    hostInput.addEventListener("change", refreshOllamaModels);
     settings.appendChild(settingsInner);
     panel.appendChild(settings);
 
@@ -1334,7 +1868,7 @@ function buildPanel() {
     async function refreshTemplates() {
         while (templateSelect.options.length > 1) templateSelect.remove(1);
         try {
-            const res = await fetch("/hermes/workflows");
+            const res = await fetch("/phosphor/workflows");
             if (!res.ok) return;
             const list = await res.json();
             list.forEach(t => {
@@ -1351,7 +1885,7 @@ function buildPanel() {
         const name = templateSelect.value;
         if (!name) return;
         try {
-            const res = await fetch(`/hermes/workflow/${encodeURIComponent(name)}`);
+            const res = await fetch(`/phosphor/workflow/${encodeURIComponent(name)}`);
             if (!res.ok) { appendMsg("err", "! ", "Template not found"); return; }
             const data = await res.json();
             const result = await _loadWorkflowData(data, name);
@@ -1368,7 +1902,7 @@ function buildPanel() {
         if (!name || !name.trim()) return;
         try {
             const workflow = app.graph.serialize();
-            const res = await fetch("/hermes/workflow/save", {
+            const res = await fetch("/phosphor/workflow/save", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ name: name.trim(), workflow }),
@@ -1402,10 +1936,15 @@ function buildPanel() {
     const input = document.createElement("textarea");
     input.id = "hm-input";
     input.rows = 1;
-    input.placeholder = "ask hermes...";
+    input.placeholder = "ask phosphor...";
     input.spellcheck = false;
 
-    inputArea.append(promptChar, input);
+    const clearBtn = document.createElement("button");
+    clearBtn.className = "hm-input-clear";
+    clearBtn.textContent = "⌫";
+    clearBtn.title = "Clear chat";
+
+    inputArea.append(promptChar, input, clearBtn);
     panel.appendChild(inputArea);
 
     // ── Hint ──
@@ -1417,12 +1956,12 @@ function buildPanel() {
     document.body.appendChild(panel);
 
     // ── Store refs ──
-    S.panel  = panel;
-    S.log    = log;
-    S.input  = input;
-    S.dot    = dot;
-    S.badge  = badge;
-    S.toggle = toggle;
+    S.panel    = panel;
+    S.log      = log;
+    S.input    = input;
+    S.provPill = provPill;
+    S.badge    = badge;
+    S.toggle   = toggle;
 
     // ── Set initial width ──
     panel.style.setProperty("--hm-w", S.width + "px");
@@ -1465,19 +2004,42 @@ function buildPanel() {
 
     // Apply settings
     applyBtn.addEventListener("click", () => {
-        CFG.ollamaHost = hostInput.value.trim() || CFG.ollamaHost;
-        CFG.model = modelInput.value.trim() || CFG.model;
-        localStorage.setItem("hermes.host", CFG.ollamaHost);
-        localStorage.setItem("hermes.model", CFG.model);
-        badge.textContent = CFG.model;
+        CFG.provider    = provInput.value;
+        CFG.apiKey      = keyInput.value.trim();
+        CFG.apiBase     = baseInput.value.trim() || CFG.apiBase;
+        CFG.apiModel    = apiModelInput.value.trim() || CFG.apiModel;
+        CFG.ollamaHost  = hostInput.value.trim() || CFG.ollamaHost;
+        CFG.ollamaModel = ollamaModelInput.value.trim() || CFG.ollamaModel;
+        localStorage.setItem("hermes.provider",    CFG.provider);
+        localStorage.setItem("hermes.apiKey",      CFG.apiKey);
+        localStorage.setItem("hermes.apiBase",     CFG.apiBase);
+        localStorage.setItem("hermes.apiModel",    CFG.apiModel);
+        localStorage.setItem("hermes.ollamaHost",  CFG.ollamaHost);
+        localStorage.setItem("hermes.ollamaModel", CFG.ollamaModel);
+        badge.textContent = currentModel();
+        provPill.textContent = CFG.provider === "ollama" ? "Local" : "API";
         settings.classList.remove("open");
         checkConnection();
-        appendMsg("sys", "", `Config updated \u2192 ${CFG.model} @ ${CFG.ollamaHost}`);
+        const endpoint = CFG.provider === "ollama" ? CFG.ollamaHost : CFG.apiBase;
+        appendMsg("sys", "", `Config updated \u2192 ${currentModel()} @ ${endpoint}`);
     });
 
     // Clear chat
     clearBtn.addEventListener("click", () => {
         handleCommand("/clear");
+    });
+
+    // Provider pill toggle
+    provPill.addEventListener("click", () => {
+        CFG.provider = CFG.provider === "ollama" ? "openrouter" : "ollama";
+        localStorage.setItem("hermes.provider", CFG.provider);
+        provPill.textContent = CFG.provider === "ollama" ? "Local" : "API";
+        provInput.value = CFG.provider;
+        syncProviderRows();
+        badge.textContent = currentModel();
+        const endpoint = CFG.provider === "ollama" ? CFG.ollamaHost : CFG.apiBase;
+        appendMsg("sys", "", `Switched to ${CFG.provider === "ollama" ? "LOCAL" : "API"} → ${currentModel()} @ ${endpoint}`);
+        checkConnection();
     });
 
     // Resize drag
@@ -1516,11 +2078,17 @@ function buildPanel() {
 
     // Initial connection check
     checkConnection().then(ok => {
+        const endpoint = CFG.provider === "ollama" ? CFG.ollamaHost : CFG.apiBase;
+        const tag = CFG.provider === "ollama" ? "LOCAL" : "API";
         if (ok) {
-            appendMsg("sys", "", `connected to ${CFG.model} @ ${CFG.ollamaHost}`);
+            appendMsg("sys", "", `[${tag}] connected to ${currentModel()} @ ${endpoint}`);
+        } else if (CFG.provider === "openrouter" && !CFG.apiKey) {
+            appendMsg("err", "! ",
+                `No API key set.\nClick ⚙ to open settings and paste your OpenRouter key,\nor toggle to LOCAL via the API/LOCAL pill.`
+            );
         } else {
             appendMsg("err", "! ",
-                `Cannot reach Ollama at ${CFG.ollamaHost}\nMake sure Ollama is running, or use /host to change endpoint.`
+                `Cannot reach ${endpoint}\nCheck settings (⚙) or toggle provider via the API/LOCAL pill.`
             );
         }
         appendMsg("sys", "", "type /help for commands");
@@ -1534,7 +2102,7 @@ function buildPanel() {
 function togglePanel() {
     S.open = !S.open;
     S.panel.classList.toggle("open", S.open);
-    S.toggle.style.display = S.open ? "none" : "block";
+    S.toggle.style.display = S.open ? "none" : "flex";
     document.body.classList.toggle("hm-open", S.open);
     document.documentElement.style.setProperty("--hm-w", S.width + "px");
     if (S.open) {
@@ -1548,7 +2116,7 @@ function togglePanel() {
 // ═══════════════════════════════════════════════════════
 
 app.registerExtension({
-    name: "hermes.comfy",
+    name: "phosphor.comfy",
 
     async setup() {
         buildPanel();
@@ -1556,7 +2124,7 @@ app.registerExtension({
 
     async nodeCreated(node) {
         // Hide the dummy node's widgets if placed on canvas
-        if (node.comfyClass === "HermesTab") {
+        if (node.comfyClass === "Phosphor") {
             if (node.widgets) {
                 for (const w of node.widgets) w.hidden = true;
             }
