@@ -47,6 +47,11 @@ const MUTATING_TOOLS = new Set([
 ]);
 const UNDO_STACK_MAX = 20;
 
+// Tools whose result is the user-facing answer. Rendered directly as a
+// phosphor> message; the agent loop short-circuits after the call so smaller
+// local models can't paraphrase, filter, or invent follow-up questions.
+const DISPLAY_TOOLS = new Set(["get_models", "list_templates"]);
+
 // ═══════════════════════════════════════════════════════
 //  TOOL DEFINITIONS  (sent to the model in system prompt)
 // ═══════════════════════════════════════════════════════
@@ -77,11 +82,11 @@ const TOOL_DEFS = [
         type: "function",
         function: {
             name: "get_models",
-            description: "List available models installed in ComfyUI (checkpoints, LoRAs, VAEs).",
+            description: "List installed models in ComfyUI by category. Categories: checkpoints, loras, vae, clip (text encoders), unet (diffusion models), controlnet, clip_vision, style_models, upscale_models, gligen, hypernetworks, photomaker. Returns only categories whose loader node is installed.",
             parameters: {
                 type: "object",
                 properties: {
-                    type: { type: "string", description: "'checkpoints', 'loras', 'vae', or 'all' (default: 'all')" }
+                    type: { type: "string", description: "Category name (e.g. 'checkpoints', 'loras', 'controlnet') or 'all' (default). Aliases accepted: 'checkpoint', 'ckpt', 'lora', 'vaes', 'text_encoders' (→clip), 'diffusion_models' (→unet), 'upscale' (→upscale_models)." }
                 }
             }
         }
@@ -137,13 +142,14 @@ const TOOL_DEFS = [
         type: "function",
         function: {
             name: "set_widget",
-            description: "Set a widget value on a node (text, seed, steps, cfg, sampler_name, scheduler, denoise, ckpt_name, etc).",
+            description: "Set a widget value on a node (text, seed, steps, cfg, sampler_name, scheduler, denoise, ckpt_name, etc). Also works on subgraph nodes to set their exposed widgets. If the canvas snapshot shows a widget as name#idxN (duplicate name, e.g. a subgraph exposing two 'text' widgets), pass the index N via the 'index' arg — name alone is ambiguous and will be rejected.",
             parameters: {
                 type: "object",
                 properties: {
                     node_id:     { type: "number", description: "Node ID" },
                     widget_name: { type: "string", description: "Widget name" },
-                    value:       { description: "New value (string, number, or boolean)" }
+                    value:       { description: "New value (string, number, or boolean)" },
+                    index:       { type: "number", description: "Widget index (0-based). Required to disambiguate when multiple widgets share a name (shown as name#idxN in the canvas snapshot). Index takes precedence over widget_name." }
                 },
                 required: ["node_id", "widget_name", "value"]
             }
@@ -345,7 +351,8 @@ You are a ComfyUI workflow assistant. Act immediately. No apologies. No asking p
 ═══ HARD RULES ═══
 
 1. NEVER call queue_prompt unless the user uses one of these EXACT words: "run", "generate", "execute", "go", "queue".
-   Words like "build", "create", "make", "load", "set up", "give me" do NOT mean run. Stop after loading.
+   Words like "build", "create", "make", "load", "set up", "give me", "pick", "swap", "change", "try", "use", "random", "show me" do NOT mean run. After setting up, swapping models, picking values, or modifying widgets — STOP. End your reply. Wait for an explicit run command.
+   queue_prompt is enforced in code: it will be blocked unless the user message contains a trigger word. If you see "BLOCKED: queue_prompt..." in a tool result, do NOT retry — tell the user the workflow is ready and ask them to say "run".
 
 2. NEVER claim a workflow "is running" or "started" or "generating". If you call queue_prompt, the only acceptable confirmation is "Queued." — anything else is a lie.
 
@@ -360,12 +367,18 @@ the info you need is already in this prompt.
 To change a widget: ONE call. set_widget(node_id=<from canvas above>, widget_name=..., value=...).
 NEVER ask the user for a node ID — find it in the canvas snapshot.
 
+SUBGRAPHS: a node shown as "subgraph(<uuid>)" is a subgraph instance. Its exposed widgets are listed like any other node's and ARE settable with set_widget. If a widget appears as name#idxN (e.g. text#idx4, text#idx5), the name is duplicated — you MUST pass index=N. Example: set_widget(node_id=9, widget_name="text", value="a red fox", index=5). Do not ask the user which index — pick it from the snapshot by matching the value shown.
+
 Templates: sd15_txt2img, sdxl_txt2img, flux_dev_txt2img, sdxl_img2img, sdxl_inpaint, upscale_4x, animatediff_video, wan_video_t2v
 When user wants a workflow, call load_template with the best match. STOP. Do not run it.
 
 CLIPTextEncode widget name is "text". KSampler widgets: seed, steps, cfg, sampler_name, scheduler, denoise. CheckpointLoaderSimple widget: ckpt_name.
 
-Maximum 1 sentence of text per response.`;
+To answer "what models do I have" call get_models() with no args, or get_models(type="loras"|"controlnet"|"upscale_models"|etc.) for one category. To load a specific model, find its loader node on the canvas and call set_widget with the matching widget name from the result (e.g. ckpt_name for checkpoints, lora_name for loras, control_net_name for controlnet). If no loader exists yet, add_node first.
+
+Maximum 1 sentence of text per response.
+
+DISPLAY TOOLS — get_models, list_templates: their output is rendered directly to the user by the UI. After you call them, the turn ENDS. Do not write any prose before or after the call. Just emit the tool_call and stop.`;
 
 // ═══════════════════════════════════════════════════════
 //  STYLES
@@ -863,23 +876,55 @@ const TOOL_IMPL = {
         const info = await getObjectInfo();
         if (!info) return JSON.stringify({ error: "Could not fetch node info" });
 
-        const result = {};
-        if (type === "all" || type === "checkpoints") {
-            const ckpt = info["CheckpointLoaderSimple"];
-            if (ckpt?.input?.required?.ckpt_name)
-                result.checkpoints = ckpt.input.required.ckpt_name[0];
+        // Category → [loader node type, widget/input name on that loader]
+        const LOADERS = {
+            checkpoints:    ["CheckpointLoaderSimple", "ckpt_name"],
+            loras:          ["LoraLoader",             "lora_name"],
+            vae:            ["VAELoader",              "vae_name"],
+            clip:           ["CLIPLoader",             "clip_name"],
+            unet:           ["UNETLoader",             "unet_name"],
+            controlnet:     ["ControlNetLoader",       "control_net_name"],
+            clip_vision:    ["CLIPVisionLoader",       "clip_name"],
+            style_models:   ["StyleModelLoader",       "style_model_name"],
+            upscale_models: ["UpscaleModelLoader",     "model_name"],
+            gligen:         ["GLIGENLoader",           "gligen_name"],
+            hypernetworks:  ["HypernetworkLoader",     "hypernetwork_name"],
+            photomaker:     ["PhotoMakerLoader",       "photomaker_model_name"],
+        };
+        const ALIAS = {
+            checkpoint: "checkpoints", ckpt: "checkpoints",
+            lora: "loras",
+            vaes: "vae",
+            text_encoders: "clip",
+            diffusion_models: "unet",
+            upscale: "upscale_models",
+        };
+
+        const want = type === "all"
+            ? Object.keys(LOADERS)
+            : [ALIAS[type] || type];
+
+        // Return plain text already shaped like the desired display.
+        // Smaller models can't reliably reformat JSON into a clean list — so we
+        // hand them the final form and tell them (in the prompt) to echo it verbatim.
+        const sections = [];
+        for (const cat of want) {
+            const spec = LOADERS[cat];
+            if (!spec) continue;
+            const [nodeType, fieldName] = spec;
+            const node = info[nodeType];
+            const enumList = node?.input?.required?.[fieldName]?.[0]
+                          ?? node?.input?.optional?.[fieldName]?.[0];
+            if (Array.isArray(enumList) && enumList.length) {
+                const header = `# ${cat} (${enumList.length}) — load via set_widget on ${nodeType}.${fieldName}`;
+                sections.push(header + "\n" + enumList.join("\n"));
+            }
         }
-        if (type === "all" || type === "loras") {
-            const lora = info["LoraLoader"];
-            if (lora?.input?.required?.lora_name)
-                result.loras = lora.input.required.lora_name[0];
+        if (sections.length === 0) {
+            if (type !== "all") return `No loader found for category "${type}". Try 'all' to see what's available.`;
+            return "No model loaders detected in /object_info.";
         }
-        if (type === "all" || type === "vae") {
-            const vae = info["VAELoader"];
-            if (vae?.input?.required?.vae_name)
-                result.vae = vae.input.required.vae_name[0];
-        }
-        return JSON.stringify(result, null, 1);
+        return sections.join("\n\n");
     },
 
     async add_node({ type, x, y }) {
@@ -922,18 +967,45 @@ const TOOL_IMPL = {
         }
     },
 
-    async set_widget({ node_id, widget_name, value }) {
+    async set_widget({ node_id, widget_name, value, index }) {
         const node = app.graph.getNodeById(node_id);
         if (!node) return `Error: node ${node_id} not found`;
-        const w = node.widgets?.find(wi => wi.name === widget_name);
-        if (!w) {
-            const available = node.widgets?.map(wi => wi.name).join(", ") || "none";
-            return `Error: widget "${widget_name}" not found. Available: ${available}`;
+        const widgets = node.widgets || [];
+        if (widgets.length === 0) return `Error: node ${node_id} (${node.type}) has no widgets`;
+
+        const listing = widgets.map((wi, i) => `${i}:${wi.name}`).join(", ");
+        let w;
+        if (index !== undefined && index !== null) {
+            // Index wins — the only way to reach duplicate-named widgets
+            // (e.g. a subgraph exposing two inner "text" widgets).
+            w = widgets[index];
+            if (!w) return `Error: no widget at index ${index}. Node #${node_id} has ${widgets.length}: ${listing}`;
+        } else {
+            const matches = widgets
+                .map((wi, i) => ({ wi, i }))
+                .filter(({ wi }) => wi.name === widget_name);
+            if (matches.length === 0) {
+                return `Error: widget "${widget_name}" not found. Available: ${listing}`;
+            }
+            if (matches.length > 1) {
+                const opts = matches.map(({ wi, i }) => `index ${i} (currently ${JSON.stringify(wi.value)})`).join("; ");
+                return `Ambiguous: ${matches.length} widgets named "${widget_name}" on #${node_id}. Retry set_widget with an "index" argument. Options: ${opts}.`;
+            }
+            w = matches[0].wi;
         }
+
+        const idx    = widgets.indexOf(w);
+        const before = w.value;
         w.value = value;
-        if (w.callback) w.callback(value);
+        // ComfyUI widget callbacks vary in signature; the canvas/node args
+        // matter for proxied subgraph widgets to propagate inward.
+        try { if (w.callback) w.callback(w.value, app.canvas, node); } catch { /* value already assigned */ }
         app.graph.setDirtyCanvas(true, true);
-        return `Set ${node.type}#${node_id}.${widget_name} = ${JSON.stringify(value)}`;
+
+        const after = w.value;
+        const stuck = JSON.stringify(after) === JSON.stringify(value);
+        return `Set ${node.type}#${node_id} widget[${idx}] "${w.name}" = ${JSON.stringify(after)}`
+            + (stuck ? "" : ` (WARNING: read-back=${JSON.stringify(after)}, was ${JSON.stringify(before)} — did not stick; widget may be read-only or a proxy)`);
     },
 
     async set_node_position({ node_id, x, y }) {
@@ -1010,10 +1082,22 @@ const TOOL_IMPL = {
         const group = new LiteGraph.LGraphGroup();
         group.title = title;
         if (group.color !== undefined) group.color = color;
-        group.bounding = [minX, minY, maxX - minX, maxY - minY];
+        const w = maxX - minX;
+        const h = maxY - minY;
+        // Set every place LiteGraph might read group dimensions from.
+        // Different ComfyUI versions disagree on whether `bounding`, `_bounding`,
+        // or `pos`+`size` is canonical, so we set them all.
+        group._bounding = [minX, minY, w, h];
+        group.bounding  = [minX, minY, w, h];
+        if ("pos"  in group) group.pos  = [minX, minY];
+        if ("size" in group) group.size = [w, h];
         app.graph.add(group);
+        // Tell the group which nodes are inside so dragging the group moves them.
+        if (typeof group.recomputeInsideNodes === "function") {
+            group.recomputeInsideNodes();
+        }
         app.graph.setDirtyCanvas(true, true);
-        return `Created group "${title}" around ${nodes.length} nodes.`;
+        return `Created group "${title}" (${Math.round(w)}×${Math.round(h)}) around ${nodes.length} nodes.`;
     },
 
     async load_workflow({ workflow }) {
@@ -1165,16 +1249,26 @@ function getCanvasSnapshot() {
     if (nodes.length === 0) {
         return "═══ CURRENT CANVAS ═══\n(empty — no nodes on canvas)";
     }
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const lines = nodes.map(n => {
-        const widgets = (n.widgets || [])
-            .map(w => {
+        const ws = n.widgets || [];
+        const nameCount = {};
+        ws.forEach(w => { nameCount[w.name] = (nameCount[w.name] || 0) + 1; });
+        const widgets = ws
+            .map((w, i) => {
                 let v = w.value;
                 if (typeof v === "string" && v.length > 80) v = v.slice(0, 77) + "...";
-                return `${w.name}=${JSON.stringify(v)}`;
+                // Disambiguate duplicate names (subgraphs expose e.g. two "text").
+                // The model must pass index=i to set_widget for these.
+                const id = nameCount[w.name] > 1 ? `${w.name}#idx${i}` : w.name;
+                return `${id}=${JSON.stringify(v)}`;
             })
             .join(", ");
+        // Subgraph instance: type is the definition UUID — unreadable. Label it.
+        const isSub = UUID_RE.test(n.type || "");
+        const typeLabel = isSub ? `subgraph(${n.type})` : n.type;
         const title = n.title && n.title !== n.type ? ` "${n.title}"` : "";
-        return `#${n.id} ${n.type}${title}${widgets ? " | " + widgets : ""}`;
+        return `#${n.id} ${typeLabel}${title}${widgets ? " | " + widgets : ""}`;
     });
     return `═══ CURRENT CANVAS (${nodes.length} nodes) ═══\n${lines.join("\n")}`;
 }
@@ -1305,9 +1399,23 @@ function parseXmlToolCalls(text) {
     return calls;
 }
 
+// Words that count as explicit permission to queue_prompt.
+const RUN_TRIGGERS = /\b(run|generate|execute|queue|go)\b/i;
+
 async function execToolCall(call) {
     const fn = TOOL_IMPL[call.name];
     if (!fn) return `Error: unknown tool "${call.name}"`;
+    // Hard guard: queue_prompt requires the user's latest message to contain
+    // an explicit run trigger. Prompt rules alone are not reliable on smaller
+    // models — this enforces the contract in code.
+    if (call.name === "queue_prompt") {
+        const lastUser = [...S.history].reverse().find(m => m.role === "user");
+        const text = lastUser?.content || "";
+        if (!RUN_TRIGGERS.test(text)) {
+            const preview = text.slice(0, 60);
+            return `BLOCKED: queue_prompt requires an explicit run command from the user. Their last message was "${preview}" — no trigger word ("run", "generate", "execute", "queue", "go"). Do NOT retry. Tell the user the workflow is ready and ask them to say "run" to execute it.`;
+        }
+    }
     // Snapshot the canvas before any mutating tool — gives us undo.
     if (MUTATING_TOOLS.has(call.name)) {
         try {
@@ -1452,6 +1560,7 @@ async function handleSend(userText) {
             // Execute each tool and feed results back as user messages
             // (avoids the OpenAI requirement for tool_call_id/call_id on `role: tool` messages,
             //  since we use XML <tool_call> blocks rather than native function calling)
+            let shortCircuit = false;
             for (const call of calls) {
                 const toolResult = await execToolCall(call);
                 appendToolBlock(call.name, call.arguments, toolResult);
@@ -1459,7 +1568,17 @@ async function handleSend(userText) {
                     role: "user",
                     content: `<tool_response name="${call.name}">\n${String(toolResult)}\n</tool_response>`,
                 });
+                // Display tools: result IS the answer. Render directly and end the turn
+                // so the model can't paraphrase/filter/ask follow-ups.
+                const okText = typeof toolResult === "string"
+                    && !toolResult.startsWith("Error")
+                    && !toolResult.startsWith("BLOCKED");
+                if (DISPLAY_TOOLS.has(call.name) && okText) {
+                    appendMsg("bot", "phosphor>", toolResult);
+                    shortCircuit = true;
+                }
             }
+            if (shortCircuit) break;
         }
     } finally {
         S.busy = false;
@@ -1529,11 +1648,54 @@ function handleCommand(text) {
             });
             break;
 
+        case "/models": {
+            // Direct ComfyUI API call — no LLM involved. Deterministic, instant.
+            const ALIAS = {
+                ckpt: "checkpoints", checkpoint: "checkpoints",
+                lora: "loras",
+                vaes: "vae",
+                clip: "text_encoders",
+                unet: "diffusion_models",
+                upscale: "upscale_models",
+            };
+            const arg = parts[1]?.toLowerCase();
+            const cat = arg ? (ALIAS[arg] || arg) : null;
+            (async () => {
+                try {
+                    if (!cat) {
+                        // List all non-empty categories with counts
+                        const folders = await (await fetch("/api/experiment/models")).json();
+                        const counts = await Promise.all(folders.map(async f => {
+                            try {
+                                const files = await (await fetch(`/api/experiment/models/${encodeURIComponent(f.name)}`)).json();
+                                return [f.name, Array.isArray(files) ? files.length : 0];
+                            } catch { return [f.name, 0]; }
+                        }));
+                        const lines = counts.filter(([, n]) => n > 0).map(([n, c]) => `${n} (${c})`);
+                        appendMsg("sys", "", lines.length ? lines.join("\n") : "No models found.");
+                    } else {
+                        const res = await fetch(`/api/experiment/models/${encodeURIComponent(cat)}`);
+                        if (!res.ok) { appendMsg("err", "! ", `No category "${cat}"`); return; }
+                        const files = await res.json();
+                        if (!Array.isArray(files) || files.length === 0) {
+                            appendMsg("sys", "", `${cat}: empty`);
+                            return;
+                        }
+                        appendMsg("sys", "", files.map(f => f.name).join("\n"));
+                    }
+                } catch (e) {
+                    appendMsg("err", "! ", `/models failed: ${e.message}`);
+                }
+            })();
+            break;
+        }
+
         case "/help":
             appendMsg("sys", "", [
                 "COMMANDS",
                 "  /clear       reset chat history",
                 "  /undo        revert last canvas change",
+                "  /models [cat] list installed models (no LLM). cat = checkpoints, loras, vae, controlnet, ...",
                 "  /model X     switch model (e.g. anthropic/claude-sonnet-4.6)",
                 "  /key X       set API key",
                 "  /base URL    change API base URL",

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Deploy phosphor to ComfyUI custom_nodes
-SRC="/c/AI/claude/hermestab"
+SRC="/c/AI/claude/phosphor"
 DST="/c/AI/comfy/ComfyUI/custom_nodes/phosphor"
 OLD_DST="/c/AI/comfy/ComfyUI/custom_nodes/hermestab"
 
