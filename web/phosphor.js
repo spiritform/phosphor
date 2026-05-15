@@ -33,7 +33,7 @@ const S = {
     open:      false,
     connected: false,
     undoStack: [],   // canvas snapshots taken before each mutating tool call
-    width: parseInt(localStorage.getItem("hermes.panelWidth")) || 420,
+    width: parseInt(localStorage.getItem("hermes.panelWidth")) || 480,
     // DOM refs (set in buildPanel)
     panel: null, log: null, input: null, provPill: null, badge: null, toggle: null,
 };
@@ -412,7 +412,7 @@ const STYLES = `
 /* ── Panel ── */
 #hm-panel {
     position: fixed; top: var(--hm-top, 70px); right: 0;
-    width: var(--hm-w, 420px); height: calc(100vh - var(--hm-top, 70px));
+    width: var(--hm-w, 480px); height: calc(100vh - var(--hm-top, 70px));
     background: rgba(4, 14, 11, 0.32);
     backdrop-filter: blur(22px) saturate(170%);
     -webkit-backdrop-filter: blur(22px) saturate(170%);
@@ -497,6 +497,8 @@ body.hm-resizing #hm-panel { transition: none !important; }
     text-shadow: 0 0 10px rgba(51,255,170,0.5), 0 0 20px rgba(51,255,170,0.2);
     flex-grow: 1;
     letter-spacing: 1px;
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 /* Provider+model label, plain text (no pill/box). Same monospace as the panel. */
 .hm-prov-label {
