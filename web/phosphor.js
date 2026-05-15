@@ -44,6 +44,7 @@ const MUTATING_TOOLS = new Set([
     "set_node_position", "set_node_size", "arrange_grid",
     "normalize_node_widths", "group_nodes",
     "load_workflow", "load_template", "clear_canvas", "build_workflow",
+    "heal_models",
 ]);
 const UNDO_STACK_MAX = 20;
 
@@ -96,6 +97,14 @@ const TOOL_DEFS = [
         function: {
             name: "validate_workflow",
             description: "Run deterministic structural checks on the current canvas: unconnected required inputs, model/enum widget values that aren't installed, missing output node, type mismatches, orphan nodes. Returns a findings list. ALWAYS call this before explaining why a workflow won't run — diagnose from the findings, do not guess — then offer concrete fixes.",
+            parameters: { type: "object", properties: {} }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "heal_models",
+            description: "Deterministically fix every model reference on the canvas: any checkpoint/lora/vae/etc. widget whose value isn't installed is swapped to the closest installed match. No node IDs needed — it scans the whole graph. Call this whenever a model 'isn't installed', a template loaded with a bad checkpoint, or the user asks to fix/repair models.",
             parameters: { type: "object", properties: {} }
         }
     },
@@ -380,7 +389,7 @@ SUBGRAPHS: a node shown as "subgraph(<uuid>)" is a subgraph instance. Its expose
 DEBUGGING: when the user asks why a workflow won't run, what's wrong, or to check/debug/fix it, call validate_workflow FIRST. Diagnose strictly from its findings — never guess at problems. Then explain the findings plainly and offer to apply concrete fixes (connect_nodes / set_widget / add_node). If validate_workflow reports OK, say it's structurally fine and the issue is likely a setting — suggest what.
 
 Templates: sd15_txt2img, sdxl_txt2img, flux_dev_txt2img, sdxl_img2img, sdxl_inpaint, upscale_4x, animatediff_video, wan_video_t2v
-When user wants a workflow, call load_template with the best match. STOP. Do not run it.
+load_template FUZZY-MATCHES the name — pass your best guess ("txt2img", "text to image", "simple t2i" all resolve to a real template). When the user wants any workflow, IMMEDIATELY call load_template with your best guess. STOP after it loads. Do NOT run it. NEVER ask which template, NEVER ask permission, NEVER say a template "does not exist" — just call load_template and it resolves. For a generic "text to image" / "simple" request, pass "txt2img" (resolves to sd15_txt2img). Templates auto-heal model references on load (uninstalled checkpoint → closest installed). If a model "isn't installed" or the user asks to fix models, call heal_models — NEVER hand-set ckpt_name with set_widget (you get node IDs wrong); heal_models needs no IDs.
 
 CLIPTextEncode widget name is "text". KSampler widgets: seed, steps, cfg, sampler_name, scheduler, denoise. CheckpointLoaderSimple widget: ckpt_name.
 
@@ -841,7 +850,7 @@ async function _loadWorkflowData(data, label) {
 // the model never has to *discover* structural bugs — only explain them.
 // Primitive widget-style input types. Unconnected, these fall back to a
 // default — so a missing one is not a structural bug.
-const WIDGET_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "NUMBER"]);
+const WIDGET_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "NUMBER", "COMBO"]);
 
 async function validateWorkflow() {
     const nodes = app.graph?._nodes || [];
@@ -871,26 +880,26 @@ async function validateWorkflow() {
             for (const k of Object.keys(def.input.required || {})) requiredInputs.add(k);
         }
 
-        // 1. Dangling inputs (required = error, optional/unknown = warning)
+        // 1. Dangling inputs. Widget-style inputs (COMBO/INT/FLOAT/STRING/
+        //    BOOLEAN) are satisfied by their widget value, never a wire — so
+        //    they are never a "not connected" problem regardless of whether
+        //    object_info marks them required. Their VALUE validity (e.g. a
+        //    model not installed) is checked separately in section 2.
         for (const inp of ins) {
+            const itype = String(inp.type || "").toUpperCase();
+            if (WIDGET_TYPES.has(itype)) continue;
             if (inp.link == null) {
                 if (def && requiredInputs.has(inp.name)) {
                     errors.push(`${tag}: required input '${inp.name}' (${inp.type}) not connected`);
                 } else if (def) {
                     warnings.push(`${tag}: optional input '${inp.name}' not connected`);
-                } else {
-                    // Unknown node type (custom/group node — no object_info schema).
-                    // Only flag missing STRUCTURAL inputs (MODEL/LATENT/IMAGE/...).
-                    // Widget-style inputs (seed/steps as INT/FLOAT/STRING) fall
-                    // back to their default when unconnected — not a bug.
-                    const t = String(inp.type || "").toUpperCase();
-                    if (t && t !== "*" && !WIDGET_TYPES.has(t)) {
-                        warnings.push(`${tag}: structural input '${inp.name}' (${inp.type}) not connected (unknown node type — verify)`);
-                    }
+                } else if (itype && itype !== "*") {
+                    warnings.push(`${tag}: structural input '${inp.name}' (${inp.type}) not connected (unknown node type — verify)`);
                 }
             } else {
                 const lk = getLink(inp.link);
-                if (lk && lk.type && inp.type && inp.type !== "*" && lk.type !== "*" && lk.type !== inp.type) {
+                const ltype = String(lk?.type || "").toUpperCase();
+                if (lk && ltype && itype && itype !== "*" && ltype !== "*" && ltype !== itype) {
                     errors.push(`${tag}: input '${inp.name}' expects ${inp.type} but is wired from ${lk.type}`);
                 }
             }
@@ -938,6 +947,115 @@ async function validateWorkflow() {
     if (errors.length)   parts.push(`ERRORS (${errors.length})\n  ${errors.join("\n  ")}`);
     if (warnings.length) parts.push(`WARNINGS (${warnings.length})\n  ${warnings.join("\n  ")}`);
     return parts.join("\n");
+}
+
+// ═══════════════════════════════════════════════════════
+//  TEMPLATE RESOLUTION (fuzzy — LLM gives intent, code finds it)
+// ═══════════════════════════════════════════════════════
+// The weak local model guesses plausible-but-wrong template names
+// ("txt2img", "text to image"). Rather than hard-fail and make it
+// flail, resolve the closest real template. Shared by the
+// load_template tool and the /template command.
+function _normTpl(s) {
+    return String(s || "").toLowerCase()
+        .replace(/text[\s_-]*to[\s_-]*image|text2image|txt2image|\bt2i\b/g, "txt2img")
+        .replace(/image[\s_-]*to[\s_-]*image|image2image|img2image|\bi2i\b/g, "img2img")
+        .replace(/[^a-z0-9]/g, "");
+}
+
+async function loadTemplateFuzzy(query) {
+    let list = [];
+    try {
+        const res = await fetch("/phosphor/workflows");
+        if (res.ok) list = await res.json();
+    } catch { /* offline — handled below */ }
+    const names = (list || []).map(x => x.name);
+    if (names.length === 0) return { ok: false, msg: "No templates available in workflows/." };
+
+    const q = _normTpl(query);
+    const PREF = ["sd15_txt2img", "sdxl_txt2img", "flux_dev_txt2img"];
+
+    // 1. exact (normalized)  2. substring either way  3. token overlap
+    let hit = names.find(n => _normTpl(n) === q);
+    if (!hit && q) {
+        const contains = names.filter(n => _normTpl(n).includes(q) || q.includes(_normTpl(n)));
+        if (contains.length) hit = PREF.find(p => contains.includes(p)) || contains[0];
+    }
+    if (!hit && q) {
+        const qtok = q.match(/[a-z]+|[0-9]+/g) || [];
+        let best = null, bestScore = 0;
+        for (const n of names) {
+            const nn = _normTpl(n);
+            const score = qtok.reduce((s, t) => s + (nn.includes(t) ? 1 : 0), 0);
+            if (score > bestScore) { bestScore = score; best = n; }
+        }
+        if (bestScore > 0) hit = best;
+    }
+    if (!hit) return { ok: false, msg: `No template matches "${query}". Available: ${names.join(", ")}` };
+
+    try {
+        const res = await fetch(`/phosphor/workflow/${encodeURIComponent(hit)}`);
+        if (!res.ok) return { ok: false, msg: `Template "${hit}" failed to load (${res.status}).` };
+        const data = await res.json();
+        const loaded = await _loadWorkflowData(data, hit);
+        const note = _normTpl(hit) === q ? "" : ` (closest match for "${query}")`;
+        const heal = await healModelWidgets();
+        const healMsg = heal.changed.length ? `\n${heal.msg}` : "";
+        return { ok: true, msg: `${loaded}${note}${healMsg}` };
+    } catch (e) {
+        return { ok: false, msg: `Error loading "${hit}": ${e.message}` };
+    }
+}
+
+// ═══════════════════════════════════════════════════════
+//  MODEL AUTO-HEAL (deterministic — no LLM, no node IDs)
+// ═══════════════════════════════════════════════════════
+// Templates hardcode model filenames that won't match every install
+// (e.g. v1-5-pruned-emaonly.safetensors vs .ckpt). Scan every node's
+// model/enum widgets; if a value isn't installed, swap it to the
+// closest installed match. This is the recurring fix the weak local
+// model keeps failing at (wrong node IDs) — so code does it instead.
+function _baseName(s) {
+    return String(s).split(/[\\/]/).pop().replace(/\.[^.]+$/, "").toLowerCase();
+}
+function _pickClosest(value, allowed) {
+    const vb = _baseName(value);
+    let m = allowed.find(a => _baseName(a) === vb);
+    if (!m) m = allowed.find(a => { const b = _baseName(a); return b.includes(vb) || vb.includes(b); });
+    if (!m) m = allowed[0];
+    return m;
+}
+async function healModelWidgets() {
+    const info = await getObjectInfo();
+    const nodes = app.graph?._nodes || [];
+    if (!info) return { ok: false, changed: [], msg: "object_info unavailable — cannot auto-heal model references." };
+    const changed = [];
+    for (const n of nodes) {
+        const def = info[n.type];
+        if (!def || !def.input || !Array.isArray(n.widgets)) continue;
+        const specs = { ...(def.input.required || {}), ...(def.input.optional || {}) };
+        for (const w of n.widgets) {
+            const spec = specs[w.name];
+            if (!Array.isArray(spec) || !Array.isArray(spec[0]) || !spec[0].length) continue;
+            const allowed = spec[0];
+            if (w.value == null || allowed.includes(w.value)) continue;
+            const repl = _pickClosest(String(w.value), allowed);
+            if (repl && repl !== w.value) {
+                const old = w.value;
+                w.value = repl;
+                try { if (w.callback) w.callback(repl, app.canvas, n); } catch { /* value set regardless */ }
+                changed.push(`#${n.id} ${n.title && n.title !== n.type ? n.title : n.type}.${w.name}: "${old}" → "${repl}"`);
+            }
+        }
+    }
+    if (changed.length) app.graph.setDirtyCanvas(true, true);
+    return {
+        ok: true,
+        changed,
+        msg: changed.length
+            ? `Auto-healed ${changed.length} model reference(s):\n${changed.join("\n")}`
+            : "All model references valid — nothing to heal.",
+    };
 }
 
 const TOOL_IMPL = {
@@ -1228,14 +1346,13 @@ const TOOL_IMPL = {
     },
 
     async load_template({ name }) {
-        try {
-            const res = await fetch(`/phosphor/workflow/${encodeURIComponent(name)}`);
-            if (!res.ok) return `Error: template "${name}" not found`;
-            const data = await res.json();
-            return await _loadWorkflowData(data, name);
-        } catch (e) {
-            return `Error: ${e.message}`;
-        }
+        const r = await loadTemplateFuzzy(name);
+        return r.msg;
+    },
+
+    async heal_models() {
+        const r = await healModelWidgets();
+        return r.msg;
     },
 
     async list_templates() {
@@ -1823,6 +1940,36 @@ function handleCommand(text) {
             });
             break;
 
+        case "/template":
+        case "/templates": {
+            // Deterministic — no LLM. No arg = list; arg = fuzzy-load.
+            const q = parts.slice(1).join(" ").trim();
+            if (!q) {
+                fetch("/phosphor/workflows")
+                    .then(r => r.ok ? r.json() : [])
+                    .then(list => {
+                        const names = (list || []).map(x => x.name);
+                        appendMsg("sys", "", names.length
+                            ? `load one with: /template <name>\n\n${names.join("\n")}`
+                            : "No templates in workflows/.");
+                    })
+                    .catch(e => appendMsg("err", "! ", `/templates failed: ${e.message}`));
+            } else {
+                loadTemplateFuzzy(q).then(r => {
+                    appendMsg(r.ok ? "sys" : "err", r.ok ? "" : "! ", r.msg);
+                }).catch(e => appendMsg("err", "! ", `/template failed: ${e.message}`));
+            }
+            break;
+        }
+
+        case "/heal":
+            // Deterministic — swap any uninstalled model widget value to
+            // the closest installed match. No LLM, no node IDs.
+            healModelWidgets().then(r => {
+                appendMsg(r.ok ? "sys" : "err", r.ok ? "" : "! ", r.msg);
+            }).catch(e => appendMsg("err", "! ", `/heal failed: ${e.message}`));
+            break;
+
         case "/help":
             appendMsg("sys", "", [
                 "COMMANDS",
@@ -1831,6 +1978,9 @@ function handleCommand(text) {
                 "  /models                list model categories + counts (no LLM)",
                 "  /models checkpoints    list every checkpoint (or: loras, vae, controlnet, clip, unet ...)",
                 "  /validate              structural check of the current workflow (no LLM)",
+                "  /templates             list workflow templates (no LLM)",
+                "  /template sd15_txt2img load a template — fuzzy, so 'txt2img' works too",
+                "  /heal                  fix uninstalled model refs → closest match (no LLM)",
                 "  /model X               switch model (e.g. anthropic/claude-sonnet-4.6)",
                 "  /key X                 set API key",
                 "  /base URL              change API base URL",
