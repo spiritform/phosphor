@@ -365,6 +365,12 @@ For each function call return a json object with function name and arguments wit
 
 You are a ComfyUI workflow assistant. Act immediately. No apologies. No asking permission. No explaining plans.
 
+OUTPUT RULES (strict):
+- NEVER restate a tool call as JSON, a code block, or prose. Just emit the <tool_call> and nothing else.
+- NEVER narrate reasoning ("First, I need to identify...", "Let's assume...", "Here's how we can..."). No preamble.
+- After a tool runs, reply with AT MOST one short sentence confirming the result, or say nothing.
+- Never explain which node you chose or why. The faded tool block already shows the user the call.
+
 ═══ HARD RULES ═══
 
 1. NEVER call queue_prompt unless the user uses one of these EXACT words: "run", "generate", "execute", "go", "queue".
@@ -499,17 +505,29 @@ body.hm-resizing #hm-panel { transition: none !important; }
     transition: color 0.2s, text-shadow 0.2s;
     display: inline-flex;
     align-items: baseline;
+    max-width: 180px;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
 }
 .hm-prov-word {
     cursor: pointer;
     user-select: none;
     transition: color 0.15s, text-shadow 0.15s;
+    flex-shrink: 0;
+    white-space: nowrap;
 }
 .hm-prov-word:hover {
     text-shadow: 0 0 6px rgba(51,255,170,0.5);
 }
-.hm-prov-sep { color: #4a7a6a; }
-.hm-prov-model { color: inherit; opacity: 0.85; }
+.hm-prov-sep { color: #4a7a6a; flex-shrink: 0; }
+.hm-prov-model {
+    color: inherit; opacity: 0.85;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 /* Color the whole label green when connected (replaces old dot indicator) */
 .hm-prov-word.connected,
 .hm-prov-word.connected ~ .hm-prov-model { color: #33ffaa; }
@@ -1203,6 +1221,21 @@ const TOOL_IMPL = {
     },
 
     async set_widget({ node_id, widget_name, value, index }) {
+        // Guard: never write null/empty. The weak model emits these and
+        // silently zeroes widgets (latent width/height → 0, blank prompts).
+        if (value === null || value === undefined ||
+            value === "null" || value === "undefined" || value === "") {
+            return `Error: refusing to set "${widget_name}" to ${JSON.stringify(value)} — not a valid value. For prompts use set_prompt.`;
+        }
+        // Guard: model copies the snapshot's disambiguation label
+        // ("text#idx1") into widget_name. Parse it back to name + index.
+        if (typeof widget_name === "string") {
+            const m = widget_name.match(/^(.+?)#(?:idx)?(\d+)$/);
+            if (m) {
+                widget_name = m[1];
+                if (index === undefined || index === null) index = Number(m[2]);
+            }
+        }
         const node = app.graph.getNodeById(node_id);
         if (!node) return `Error: node ${node_id} not found`;
         const widgets = node.widgets || [];
@@ -1757,25 +1790,10 @@ async function handleSend(userText, { echo = true } = {}) {
 
             msgDiv.classList.remove("hm-cursor");
 
-            // Clean any XML tool_call tags from displayed text
-            const cleanText = result.text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "").trim();
-            if (cleanText) {
-                bodyEl.textContent = cleanText;
-            } else {
-                // No prose content — model only emitted tool calls. Drop the empty "hermes>" line.
-                msgDiv.remove();
-            }
-
-            // Build assistant history entry
-            const assistantMsg = { role: "assistant", content: result.text || "" };
-            if (result.toolCalls.length > 0) {
-                assistantMsg.tool_calls = result.toolCalls;
-            }
-            S.history.push(assistantMsg);
-
-            // Parse tool calls from XML tags
+            // Parse tool calls (XML or native) up front — we must know
+            // whether this is an "action" turn or a "conversation" turn
+            // before deciding what to display.
             let calls = parseXmlToolCalls(result.text);
-            // Native tool calls as fallback
             if (calls.length === 0 && result.toolCalls.length > 0) {
                 calls = result.toolCalls.map(tc => ({
                     name: tc.function?.name,
@@ -1783,6 +1801,32 @@ async function handleSend(userText, { echo = true } = {}) {
                         ? JSON.parse(tc.function.arguments)
                         : (tc.function?.arguments || {}),
                 }));
+            }
+
+            // Build assistant history entry (keep raw text for context).
+            const assistantMsg = { role: "assistant", content: result.text || "" };
+            if (result.toolCalls.length > 0) {
+                assistantMsg.tool_calls = result.toolCalls;
+            }
+            S.history.push(assistantMsg);
+
+            // Display rule: on ANY turn that fires tool calls, suppress the
+            // model's prose entirely. For this weak local model it is almost
+            // always duplicated plumbing (bare JSON, "set_widget {...}",
+            // narration, or degenerate <|im_start|> spam). The action is
+            // shown by the faded tool block + deterministic surfaced lines.
+            // Prose shows ONLY on pure-conversation turns (no tool calls).
+            if (calls.length > 0) {
+                msgDiv.remove();
+            } else {
+                const cleanText = result.text
+                    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+                    .replace(/```[\s\S]*?```/g, "")
+                    .replace(/<\|[a-z_]+\|>/gi, "")
+                    .replace(/\n{3,}/g, "\n\n")
+                    .trim();
+                if (cleanText) bodyEl.textContent = cleanText;
+                else msgDiv.remove();
             }
 
             if (calls.length === 0) break;
@@ -1806,6 +1850,18 @@ async function handleSend(userText, { echo = true } = {}) {
                     role: "user",
                     content: `<tool_response name="${call.name}">\n${String(toolResult)}\n</tool_response>`,
                 });
+                // Surface the creative result: when a prompt/text widget is
+                // set, show JUST the new text as a clean line. The plumbing
+                // stays in the faded collapsible tool block above.
+                if (call.name === "set_widget"
+                    && typeof toolResult === "string"
+                    && toolResult.startsWith("Set ")) {
+                    const wn  = String(call.arguments?.widget_name || "");
+                    const val = call.arguments?.value;
+                    if (/text|prompt/i.test(wn) && typeof val === "string" && val.trim()) {
+                        appendMsg("bot", "phosphor>", `prompt → ${val.trim()}`);
+                    }
+                }
                 // Display tools: result IS the answer. Render directly and end the turn
                 // so the model can't paraphrase/filter/ask follow-ups.
                 const okText = typeof toolResult === "string"
