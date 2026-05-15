@@ -44,7 +44,7 @@ const MUTATING_TOOLS = new Set([
     "set_node_position", "set_node_size", "arrange_grid",
     "normalize_node_widths", "group_nodes",
     "load_workflow", "load_template", "clear_canvas", "build_workflow",
-    "heal_models",
+    "heal_models", "enhance_prompt",
 ]);
 const UNDO_STACK_MAX = 20;
 
@@ -106,6 +106,19 @@ const TOOL_DEFS = [
             name: "heal_models",
             description: "Deterministically fix every model reference on the canvas: any checkpoint/lora/vae/etc. widget whose value isn't installed is swapped to the closest installed match. No node IDs needed — it scans the whole graph. Call this whenever a model 'isn't installed', a template loaded with a bad checkpoint, or the user asks to fix/repair models.",
             parameters: { type: "object", properties: {} }
+        }
+    },
+    {
+        type: "function",
+        function: {
+            name: "enhance_prompt",
+            description: "Take the CURRENT positive (or negative) prompt already on the canvas and rewrite it richer and more detailed, writing it back to the correct node automatically. No node IDs needed. Use this whenever the user asks to enhance/improve/expand/elaborate/make-more-detailed the prompt.",
+            parameters: {
+                type: "object",
+                properties: {
+                    target: { type: "string", description: "'positive' (default) or 'negative'" }
+                }
+            }
         }
     },
     {
@@ -396,6 +409,8 @@ DEBUGGING: when the user asks why a workflow won't run, what's wrong, or to chec
 
 Templates: sd15_txt2img, sdxl_txt2img, flux_dev_txt2img, sdxl_img2img, sdxl_inpaint, upscale_4x, animatediff_video, wan_video_t2v
 load_template FUZZY-MATCHES the name — pass your best guess ("txt2img", "text to image", "simple t2i" all resolve to a real template). When the user wants any workflow, IMMEDIATELY call load_template with your best guess. STOP after it loads. Do NOT run it. NEVER ask which template, NEVER ask permission, NEVER say a template "does not exist" — just call load_template and it resolves. For a generic "text to image" / "simple" request, pass "txt2img" (resolves to sd15_txt2img). Templates auto-heal model references on load (uninstalled checkpoint → closest installed). If a model "isn't installed" or the user asks to fix models, call heal_models — NEVER hand-set ckpt_name with set_widget (you get node IDs wrong); heal_models needs no IDs.
+
+When the user asks to enhance / improve / expand / elaborate / "make more detailed" an existing prompt, call enhance_prompt (target "positive" or "negative"). It reads the current prompt, rewrites it, and writes it back to the right node — NEVER hand-edit prompts with set_widget (you get node IDs wrong).
 
 CLIPTextEncode widget name is "text". KSampler widgets: seed, steps, cfg, sampler_name, scheduler, denoise. CheckpointLoaderSimple widget: ckpt_name.
 
@@ -1078,6 +1093,85 @@ async function healModelWidgets() {
     };
 }
 
+// ═══════════════════════════════════════════════════════
+//  PROMPT ENHANCEMENT (LLM rewrites text, code targets node)
+// ═══════════════════════════════════════════════════════
+// The model only rewrites the prompt text — a forgiving creative
+// task even small models do well. Code finds the right node and
+// writes it back, so there are no node IDs for the model to fumble.
+function _lgLink(id) {
+    const L = app.graph?.links || {};
+    return L instanceof Map ? L.get(id) : L[id];
+}
+function _findPromptNode(target = "positive") {
+    const nodes = app.graph?._nodes || [];
+    const want = /neg/i.test(target) ? "negative" : "positive";
+    // 1. trace a sampler's positive/negative input back to its source
+    for (const n of nodes) {
+        const slot = (n.inputs || []).find(i => i.name === want);
+        if (slot && slot.link != null) {
+            const lk = _lgLink(slot.link);
+            const src = lk && app.graph.getNodeById(lk.origin_id);
+            if (src && Array.isArray(src.widgets) && src.widgets.some(w => w.name === "text"))
+                return src;
+        }
+    }
+    // 2. title fallback
+    for (const n of nodes) {
+        const t = (n.title || "").toLowerCase();
+        if (want === "negative" && /neg/.test(t)) return n;
+        if (want === "positive" && /pos/.test(t) && !/neg/.test(t)) return n;
+    }
+    // 3. type fallback: CLIPTextEncode order (first = positive)
+    const enc = nodes.filter(n => /cliptextencode/i.test(n.type || ""));
+    return want === "positive" ? (enc[0] || null) : (enc[1] || null);
+}
+function _promptWidget(node) {
+    if (!node || !Array.isArray(node.widgets)) return null;
+    return node.widgets.find(w => w.name === "text")
+        || node.widgets.find(w => w.type === "customtext" || w.type === "string")
+        || null;
+}
+function _cleanGen(s) {
+    return String(s || "")
+        .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, "")
+        .replace(/```[\s\S]*?```/g, "")
+        .replace(/<\|[a-z_]+\|>/gi, "")
+        .replace(/^\s*(?:here(?:'s| is)[^:\n]*:|enhanced prompt:?|prompt:?)\s*/i, "")
+        .replace(/^["'\s]+|["'\s]+$/g, "")
+        .trim();
+}
+async function enhancePrompt(target = "positive") {
+    const label = /neg/i.test(target) ? "negative" : "positive";
+    const node = _findPromptNode(target);
+    if (!node) return { ok: false, msg: `Couldn't find a ${label} prompt node on the canvas.` };
+    const w = _promptWidget(node);
+    if (!w) return { ok: false, msg: `Prompt node #${node.id} has no text widget.` };
+    const current = String(w.value || "").trim();
+    if (!current) return { ok: false, msg: `The ${label} prompt is empty — set a base prompt first, then enhance it.` };
+
+    const sys = label === "negative"
+        ? "You improve Stable Diffusion NEGATIVE prompts. Expand the user's negative prompt with comprehensive quality/artifact terms to exclude (blurry, lowres, bad anatomy, extra limbs, watermark, jpeg artifacts, etc.) while keeping their intent. Reply with ONLY the rewritten negative prompt — no preamble, no quotes."
+        : "You are a Stable Diffusion prompt engineer. Rewrite the user's image prompt to be more vivid and detailed: keep the original subject and intent, add concrete visual detail, style, lighting, composition, mood, and quality tags. Reply with ONLY the rewritten prompt — no preamble, no quotes, no explanation.";
+    let result;
+    try {
+        result = await streamChat(
+            [{ role: "system", content: sys }, { role: "user", content: current }],
+            null, () => {}
+        );
+    } catch (e) {
+        return { ok: false, msg: `Enhancement failed: ${e.message}` };
+    }
+    const enhanced = _cleanGen(result.text);
+    if (!enhanced || enhanced.toLowerCase() === current.toLowerCase()) {
+        return { ok: false, msg: "Model didn't return a usable rewrite. Try again." };
+    }
+    w.value = enhanced;
+    try { if (w.callback) w.callback(enhanced, app.canvas, node); } catch { /* value set regardless */ }
+    app.graph.setDirtyCanvas(true, true);
+    return { ok: true, msg: `Enhanced ${label} prompt:\n\nbefore → ${current}\n\nafter → ${enhanced}` };
+}
+
 const TOOL_IMPL = {
 
     async get_canvas_info() {
@@ -1387,6 +1481,11 @@ const TOOL_IMPL = {
 
     async heal_models() {
         const r = await healModelWidgets();
+        return r.msg;
+    },
+
+    async enhance_prompt({ target = "positive" } = {}) {
+        const r = await enhancePrompt(target);
         return r.msg;
     },
 
@@ -2028,6 +2127,16 @@ function handleCommand(text) {
             }).catch(e => appendMsg("err", "! ", `/heal failed: ${e.message}`));
             break;
 
+        case "/enhance": {
+            // LLM rewrites the current prompt; code targets the node.
+            const t = /^n|neg/i.test(parts[1] || "") ? "negative" : "positive";
+            appendMsg("sys", "", `Enhancing ${t} prompt…`);
+            enhancePrompt(t).then(r => {
+                appendMsg(r.ok ? "sys" : "err", r.ok ? "" : "! ", r.msg);
+            }).catch(e => appendMsg("err", "! ", `/enhance failed: ${e.message}`));
+            break;
+        }
+
         case "/help":
             appendMsg("sys", "", [
                 "COMMANDS",
@@ -2039,6 +2148,7 @@ function handleCommand(text) {
                 "  /templates             list workflow templates (no LLM)",
                 "  /template sd15_txt2img load a template — fuzzy, so 'txt2img' works too",
                 "  /heal                  fix uninstalled model refs → closest match (no LLM)",
+                "  /enhance [neg]         rewrite the current prompt richer (positive, or 'neg')",
                 "  /model X               switch model (e.g. anthropic/claude-sonnet-4.6)",
                 "  /key X                 set API key",
                 "  /base URL              change API base URL",

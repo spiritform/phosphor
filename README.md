@@ -10,6 +10,7 @@ Phosphor pairs a conversational layer (generate prompts, describe workflows, sug
 
 ## Features
 
+- **Create & enhance prompts** — describe an idea and it writes a full image prompt; or take the prompt already on the canvas and rewrite it richer and more detailed with `/enhance`. The model writes the text, code drops it into the right node — no fiddling.
 - **Talk to your canvas** — add/connect nodes, set widgets, swap checkpoints, build whole workflows from a sentence.
 - **Two providers** — local **Ollama** or any OpenAI-compatible **API** (e.g. OpenRouter). Toggle from the header; settings persist per provider.
 - **Deterministic commands (no LLM)** — `/models`, `/templates`, `/template`, `/validate`, `/heal`. Instant, exact, can't be fumbled by a weak model.
@@ -77,6 +78,7 @@ Click `Local` → it flips to `API`. Open the ⚙ settings (or use slash command
 | `/template sd15_txt2img` | Load a template — fuzzy, so `txt2img` works too |
 | `/validate` | Structural check of the current workflow |
 | `/heal` | Repair uninstalled model references → closest installed match |
+| `/enhance` | Rewrite the current positive prompt richer/more detailed (`/enhance neg` for negative) |
 | `/workflow` | Describe the current canvas |
 | `/undo` | Revert the last canvas change |
 | `/model X` | Switch model |
@@ -85,7 +87,7 @@ Click `Local` → it flips to `API`. Open the ⚙ settings (or use slash command
 | `/clear` | Reset chat history |
 | `/help` | Show in-panel help |
 
-Everything else is natural language: *"build an SDXL txt2img workflow"*, *"make the prompt more cinematic"*, *"why won't this run?"*, *"switch to the flux checkpoint"*, *"run it"*.
+Everything else is natural language: *"write me a prompt for a neon cyberpunk alley"*, *"make the prompt more cinematic"*, *"build an SDXL txt2img workflow"*, *"why won't this run?"*, *"switch to the flux checkpoint"*, *"run it"*.
 
 ---
 
