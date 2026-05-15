@@ -94,6 +94,14 @@ const TOOL_DEFS = [
     {
         type: "function",
         function: {
+            name: "validate_workflow",
+            description: "Run deterministic structural checks on the current canvas: unconnected required inputs, model/enum widget values that aren't installed, missing output node, type mismatches, orphan nodes. Returns a findings list. ALWAYS call this before explaining why a workflow won't run — diagnose from the findings, do not guess — then offer concrete fixes.",
+            parameters: { type: "object", properties: {} }
+        }
+    },
+    {
+        type: "function",
+        function: {
             name: "add_node",
             description: "Add a new node to the canvas. Returns the node's assigned ID and its widgets. Space nodes ~300px apart.",
             parameters: {
@@ -368,6 +376,8 @@ To change a widget: ONE call. set_widget(node_id=<from canvas above>, widget_nam
 NEVER ask the user for a node ID — find it in the canvas snapshot.
 
 SUBGRAPHS: a node shown as "subgraph(<uuid>)" is a subgraph instance. Its exposed widgets are listed like any other node's and ARE settable with set_widget. If a widget appears as name#idxN (e.g. text#idx4, text#idx5), the name is duplicated — you MUST pass index=N. Example: set_widget(node_id=9, widget_name="text", value="a red fox", index=5). Do not ask the user which index — pick it from the snapshot by matching the value shown.
+
+DEBUGGING: when the user asks why a workflow won't run, what's wrong, or to check/debug/fix it, call validate_workflow FIRST. Diagnose strictly from its findings — never guess at problems. Then explain the findings plainly and offer to apply concrete fixes (connect_nodes / set_widget / add_node). If validate_workflow reports OK, say it's structurally fine and the issue is likely a setting — suggest what.
 
 Templates: sd15_txt2img, sdxl_txt2img, flux_dev_txt2img, sdxl_img2img, sdxl_inpaint, upscale_4x, animatediff_video, wan_video_t2v
 When user wants a workflow, call load_template with the best match. STOP. Do not run it.
@@ -823,6 +833,113 @@ async function _loadWorkflowData(data, label) {
     return `${tag} loaded (${count} nodes)`;
 }
 
+// ═══════════════════════════════════════════════════════
+//  WORKFLOW VALIDATION (deterministic — no LLM)
+// ═══════════════════════════════════════════════════════
+// Pure graph walk. Same workflow always yields the same findings.
+// Shared by the /validate command and the validate_workflow tool so
+// the model never has to *discover* structural bugs — only explain them.
+// Primitive widget-style input types. Unconnected, these fall back to a
+// default — so a missing one is not a structural bug.
+const WIDGET_TYPES = new Set(["INT", "FLOAT", "STRING", "BOOLEAN", "NUMBER"]);
+
+async function validateWorkflow() {
+    const nodes = app.graph?._nodes || [];
+    if (nodes.length === 0) return "VALIDATION: canvas is empty — nothing to check.";
+
+    const info = await getObjectInfo();           // may be null
+    const rawLinks = app.graph.links || {};
+    const isMap = rawLinks instanceof Map;
+    const getLink = (id) => (isMap ? rawLinks.get(id) : rawLinks[id]);
+    const linkCount = isMap ? rawLinks.size : Object.keys(rawLinks).length;
+
+    const errors = [];
+    const warnings = [];
+    let hasOutput = false;
+
+    for (const n of nodes) {
+        const def = info ? info[n.type] : null;
+        const tag = `#${n.id} ${n.title && n.title !== n.type ? n.title : n.type}`;
+        const ins  = n.inputs  || [];
+        const outs = n.outputs || [];
+
+        if (def && def.output_node) hasOutput = true;
+        else if (!def && /save|preview/i.test(n.type || "")) hasOutput = true;
+
+        const requiredInputs = new Set();
+        if (def && def.input) {
+            for (const k of Object.keys(def.input.required || {})) requiredInputs.add(k);
+        }
+
+        // 1. Dangling inputs (required = error, optional/unknown = warning)
+        for (const inp of ins) {
+            if (inp.link == null) {
+                if (def && requiredInputs.has(inp.name)) {
+                    errors.push(`${tag}: required input '${inp.name}' (${inp.type}) not connected`);
+                } else if (def) {
+                    warnings.push(`${tag}: optional input '${inp.name}' not connected`);
+                } else {
+                    // Unknown node type (custom/group node — no object_info schema).
+                    // Only flag missing STRUCTURAL inputs (MODEL/LATENT/IMAGE/...).
+                    // Widget-style inputs (seed/steps as INT/FLOAT/STRING) fall
+                    // back to their default when unconnected — not a bug.
+                    const t = String(inp.type || "").toUpperCase();
+                    if (t && t !== "*" && !WIDGET_TYPES.has(t)) {
+                        warnings.push(`${tag}: structural input '${inp.name}' (${inp.type}) not connected (unknown node type — verify)`);
+                    }
+                }
+            } else {
+                const lk = getLink(inp.link);
+                if (lk && lk.type && inp.type && inp.type !== "*" && lk.type !== "*" && lk.type !== inp.type) {
+                    errors.push(`${tag}: input '${inp.name}' expects ${inp.type} but is wired from ${lk.type}`);
+                }
+            }
+        }
+
+        // 2. Invalid widget selection (model not installed / bad enum value)
+        if (def && def.input && Array.isArray(n.widgets)) {
+            const specs = { ...(def.input.required || {}), ...(def.input.optional || {}) };
+            for (const w of n.widgets) {
+                const spec = specs[w.name];
+                if (Array.isArray(spec) && Array.isArray(spec[0]) && spec[0].length) {
+                    const allowed = spec[0];
+                    if (w.value != null && !allowed.includes(w.value)) {
+                        const looksLikeModel = /name$|ckpt|lora|vae|model/i.test(w.name);
+                        const detail = allowed.length <= 8 ? ` (valid: ${allowed.join(", ")})` : ` (${allowed.length} valid options)`;
+                        (looksLikeModel ? errors : warnings).push(
+                            `${tag}: '${w.name}' = ${JSON.stringify(w.value)} is not installed/valid${detail}`
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3. Orphan / dead-end nodes — skip pure annotation nodes (Note,
+        // MarkdownNote, etc.) which have no slots and are never "connected".
+        const hasSlots = ins.length > 0 || outs.length > 0;
+        if (hasSlots) {
+            const anyInLinked  = ins.some(i => i.link != null);
+            const anyOutLinked = outs.some(o => Array.isArray(o.links) && o.links.length > 0);
+            if (!anyInLinked && !anyOutLinked) {
+                warnings.push(`${tag}: orphan node — not connected to anything`);
+            } else if (ins.length === 0 && !anyOutLinked && !(def && def.output_node)) {
+                warnings.push(`${tag}: outputs not connected — node does nothing`);
+            }
+        }
+    }
+
+    if (!hasOutput) {
+        errors.push("No output node (SaveImage / PreviewImage / etc.) — workflow produces nothing");
+    }
+
+    const head = `VALIDATION — ${nodes.length} nodes, ${linkCount} links`;
+    if (!errors.length && !warnings.length) return `${head}\nOK — no structural problems found.`;
+    const parts = [head];
+    if (errors.length)   parts.push(`ERRORS (${errors.length})\n  ${errors.join("\n  ")}`);
+    if (warnings.length) parts.push(`WARNINGS (${warnings.length})\n  ${warnings.join("\n  ")}`);
+    return parts.join("\n");
+}
+
 const TOOL_IMPL = {
 
     async get_canvas_info() {
@@ -1236,6 +1353,10 @@ const TOOL_IMPL = {
         if (errors.length) summary.errors = errors;
         return JSON.stringify(summary, null, 1);
     },
+
+    async validate_workflow() {
+        return await validateWorkflow();
+    },
 };
 
 // ═══════════════════════════════════════════════════════
@@ -1482,12 +1603,12 @@ function appendToolBlock(name, args, result) {
 //  SEND / AGENT LOOP
 // ═══════════════════════════════════════════════════════
 
-async function handleSend(userText) {
+async function handleSend(userText, { echo = true } = {}) {
     if (S.busy) return;
     S.busy = true;
     S.input.disabled = true;
 
-    appendMsg("user", "> ", userText);
+    if (echo) appendMsg("user", "> ", userText);
     S.history.push({ role: "user", content: userText });
 
     let lastCallSig = "";
@@ -1639,7 +1760,7 @@ function handleCommand(text) {
             break;
 
         case "/workflow":
-            handleSend("Describe the current workflow on the canvas in detail. Use get_canvas_info to inspect it.");
+            handleSend("Describe the current workflow on the canvas in detail. Use get_canvas_info to inspect it.", { echo: false });
             break;
 
         case "/undo":
@@ -1672,7 +1793,9 @@ function handleCommand(text) {
                             } catch { return [f.name, 0]; }
                         }));
                         const lines = counts.filter(([, n]) => n > 0).map(([n, c]) => `${n} (${c})`);
-                        appendMsg("sys", "", lines.length ? lines.join("\n") : "No models found.");
+                        appendMsg("sys", "", lines.length
+                            ? `drill in with: /models <category>  (e.g. /models checkpoints)\n\n${lines.join("\n")}`
+                            : "No models found.");
                     } else {
                         const res = await fetch(`/api/experiment/models/${encodeURIComponent(cat)}`);
                         if (!res.ok) { appendMsg("err", "! ", `No category "${cat}"`); return; }
@@ -1690,17 +1813,29 @@ function handleCommand(text) {
             break;
         }
 
+        case "/validate":
+            // Deterministic structural check — no LLM. Same as the
+            // validate_workflow tool, but rendered straight to the user.
+            validateWorkflow().then(result => {
+                appendMsg("sys", "", result);
+            }).catch(e => {
+                appendMsg("err", "! ", `/validate failed: ${e.message}`);
+            });
+            break;
+
         case "/help":
             appendMsg("sys", "", [
                 "COMMANDS",
-                "  /clear       reset chat history",
-                "  /undo        revert last canvas change",
-                "  /models [cat] list installed models (no LLM). cat = checkpoints, loras, vae, controlnet, ...",
-                "  /model X     switch model (e.g. anthropic/claude-sonnet-4.6)",
-                "  /key X       set API key",
-                "  /base URL    change API base URL",
-                "  /workflow    describe current canvas",
-                "  /help        this message",
+                "  /clear                 reset chat history",
+                "  /undo                  revert last canvas change",
+                "  /models                list model categories + counts (no LLM)",
+                "  /models checkpoints    list every checkpoint (or: loras, vae, controlnet, clip, unet ...)",
+                "  /validate              structural check of the current workflow (no LLM)",
+                "  /model X               switch model (e.g. anthropic/claude-sonnet-4.6)",
+                "  /key X                 set API key",
+                "  /base URL              change API base URL",
+                "  /workflow              describe current canvas",
+                "  /help                  this message",
                 "",
                 "TIPS",
                 "  \"load the sdxl template\"",
@@ -2146,6 +2281,7 @@ function buildPanel() {
             input.value = "";
             input.style.height = "auto";
             if (text.startsWith("/")) {
+                appendMsg("user", "> ", text);
                 handleCommand(text);
             } else {
                 handleSend(text);
